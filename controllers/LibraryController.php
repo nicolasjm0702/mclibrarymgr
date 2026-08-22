@@ -136,7 +136,7 @@ class LibraryController extends Controller
         return new JsonResponse(['files' => $files]);
     }
 
-    public function identify(Request $request, Server $server): JsonResponse
+    public function identifyBatch(Request $request, Server $server): JsonResponse
     {
         if ($response = $this->guardEnabled()) {
             return $response;
@@ -146,28 +146,33 @@ class LibraryController extends Controller
             return new JsonResponse(['message' => LibraryProviderRegistry::label($this->providerName) . ' API key not configured.'], 502);
         }
 
-        $type = $request->query('type');
+        $type = $request->input('type');
         if (!array_key_exists($type, self::FOLDERS)) {
             return new JsonResponse(['message' => "Unknown type: {$type}"], 422);
         }
 
-        $path = self::FOLDERS[$type] . '/' . $request->query('filename');
+        $repository = $this->fileRepository->setServer($server);
 
-        try {
-            $content = $this->fileRepository->setServer($server)->getContent($path, 200 * 1024 * 1024);
-            $hash = sha1($content);
-
-            $project = $this->provider->identifyByHash($hash);
-
-            if ($project === null) {
-                return new JsonResponse(['message' => 'not identified'], 404);
+        $hashesByFilename = [];
+        foreach ($request->input('filenames', []) as $filename) {
+            try {
+                $content = $repository->getContent(self::FOLDERS[$type] . '/' . $filename, 200 * 1024 * 1024);
+                $hashesByFilename[$filename] = sha1($content);
+            } catch (\Exception $exception) {
+                // Unreadable — left out of the batch, frontend treats a
+                // missing key the same as "not identified".
             }
-
-            return new JsonResponse($project);
-        } catch (\Exception $exception) {
-            // Not identifiable (user-uploaded, or a project this instance can't reach).
-            return new JsonResponse(['message' => 'not identified'], 404);
         }
+
+        $results = $this->provider->identifyByHashes($hashesByFilename);
+
+        foreach ($results as $filename => $project) {
+            if ($project !== null) {
+                $results[$filename]['project_type'] = $type;
+            }
+        }
+
+        return new JsonResponse(['results' => $results]);
     }
 
     public function uninstall(Request $request, Server $server): JsonResponse

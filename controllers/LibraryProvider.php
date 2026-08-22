@@ -10,7 +10,11 @@ interface LibraryProvider
 
     public function resolveInstallFile(array $installParams): array;
 
-    public function identifyByHash(string $sha1): ?array;
+    /**
+     * $hashesByKey is [caller key => sha1], returns [caller key => project
+     * info or null] — one round trip to the provider for the whole batch.
+     */
+    public function identifyByHashes(array $hashesByKey): array;
 
     public function searchModpacks(array $params): array;
 

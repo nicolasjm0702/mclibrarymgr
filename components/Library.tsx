@@ -347,54 +347,62 @@ export default () => {
 
         http.get(
             `/api/client/extensions/mclibrarymgr/servers/${uuid}/versions`,
-        ).then(({ data }) => setGameVersions(data.versions ?? []));
+        ).then(({ data }) => {
+            const validVersions: string[] = data.versions ?? [];
+            setGameVersions(validVersions);
 
-        const versionVariable = eggVariables.find((v) =>
-            [
-                "MINECRAFT_VERSION",
-                "MC_VERSION",
-                "SERVER_VERSION",
-                "VERSION",
-            ].includes(v.envVariable),
-        );
-        const envVersion =
-            versionVariable?.serverValue &&
-            versionVariable.serverValue !== "latest"
-                ? versionVariable.serverValue
-                : null;
+            const asRealVersion = (version: string | null) =>
+                version && validVersions.includes(version) ? version : null;
 
-        const docker = detectLoaderAndType(dockerImage, invocation);
+            const versionVariable = eggVariables.find((v) =>
+                [
+                    "MINECRAFT_VERSION",
+                    "MC_VERSION",
+                    "SERVER_VERSION",
+                    "VERSION",
+                ].includes(v.envVariable),
+            );
+            const envVersion = asRealVersion(
+                versionVariable?.serverValue &&
+                    versionVariable.serverValue !== "latest"
+                    ? versionVariable.serverValue
+                    : null,
+            );
 
-        const apply = (
-            type: string,
-            loader: string | null,
-            version: string | null,
-        ) => {
-            setType(type);
-            if (loader) setLoaders([loader]);
-            if (version) setGameVersion(version);
-            search("", {
-                type,
-                loaders: loader ? [loader] : [],
-                version: version ?? "",
-            });
-        };
+            const docker = detectLoaderAndType(dockerImage, invocation);
 
-        if (docker.loader || envVersion) {
-            apply(docker.type, docker.loader, envVersion);
-        }
+            const apply = (
+                type: string,
+                loader: string | null,
+                version: string | null,
+            ) => {
+                const realVersion = asRealVersion(version);
+                setType(type);
+                if (loader) setLoaders([loader]);
+                if (realVersion) setGameVersion(realVersion);
+                search("", {
+                    type,
+                    loaders: loader ? [loader] : [],
+                    version: realVersion ?? "",
+                });
+            };
 
-        if (!docker.loader || !envVersion) {
-            detectFromInstalledFiles(uuid).then((fromFiles) => {
-                if (!fromFiles.loader && !fromFiles.version) return;
+            if (docker.loader || envVersion) {
+                apply(docker.type, docker.loader, envVersion);
+            }
 
-                apply(
-                    fromFiles.type ?? docker.type,
-                    fromFiles.loader ?? docker.loader,
-                    fromFiles.version ?? envVersion,
-                );
-            });
-        }
+            if (!docker.loader || !envVersion) {
+                detectFromInstalledFiles(uuid).then((fromFiles) => {
+                    if (!fromFiles.loader && !fromFiles.version) return;
+
+                    apply(
+                        fromFiles.type ?? docker.type,
+                        fromFiles.loader ?? docker.loader,
+                        fromFiles.version ?? envVersion,
+                    );
+                });
+            }
+        });
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [uuid]);
 
@@ -493,27 +501,34 @@ export default () => {
     }, [type]);
 
     useEffect(() => {
+        const pending = installedFiles
+            .map((f) => f.name)
+            .filter((name) => !(name in identified));
+        if (pending.length === 0) return;
+
         let cancelled = false;
 
-        (async () => {
-            for (const f of installedFiles) {
-                if (cancelled || f.name in identified) continue;
-
-                try {
-                    const { data } = await http.get(
-                        `/api/client/extensions/mclibrarymgr/servers/${uuid}/identify`,
-                        { params: { type, filename: f.name } },
-                    );
-                    if (!cancelled) {
-                        setIdentified((prev) => ({ ...prev, [f.name]: data }));
-                    }
-                } catch (error) {
-                    if (!cancelled) {
-                        setIdentified((prev) => ({ ...prev, [f.name]: null }));
-                    }
-                }
-            }
-        })();
+        http.post(
+            `/api/client/extensions/mclibrarymgr/servers/${uuid}/identify-batch`,
+            { type, filenames: pending },
+        )
+            .then(({ data }) => {
+                if (cancelled) return;
+                const results = data.results ?? {};
+                setIdentified((prev) => ({
+                    ...prev,
+                    ...Object.fromEntries(
+                        pending.map((name) => [name, results[name] ?? null]),
+                    ),
+                }));
+            })
+            .catch(() => {
+                if (cancelled) return;
+                setIdentified((prev) => ({
+                    ...prev,
+                    ...Object.fromEntries(pending.map((name) => [name, null])),
+                }));
+            });
 
         return () => {
             cancelled = true;

@@ -309,18 +309,26 @@ export default () => {
 
         http.get(
             `/api/client/extensions/mclibrarymgr/servers/${uuid}/versions`,
-        ).then(({ data }) => setGameVersions(data.versions ?? []));
+        ).then(({ data }) => {
+            const validVersions: string[] = data.versions ?? [];
+            setGameVersions(validVersions);
+
+            detectFromInstalledFiles(uuid).then((detected) => {
+                if (!detected.loader && !detected.version) return;
+
+                const realVersion =
+                    detected.version && validVersions.includes(detected.version)
+                        ? detected.version
+                        : null;
+
+                if (detected.loader) setLoader(detected.loader);
+                if (realVersion) setGameVersion(realVersion);
+                search("", detected.loader ?? "", realVersion ?? "");
+            });
+        });
 
         refreshInstalled();
         search("", "", "");
-
-        detectFromInstalledFiles(uuid).then((detected) => {
-            if (!detected.loader && !detected.version) return;
-
-            if (detected.loader) setLoader(detected.loader);
-            if (detected.version) setGameVersion(detected.version);
-            search("", detected.loader ?? "", detected.version ?? "");
-        });
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [uuid]);
 

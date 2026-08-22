@@ -149,23 +149,45 @@ class CurseForgeProvider implements LibraryProvider
         return $versions[0]['files'][0];
     }
 
-    public function identifyByHash(string $sha1): ?array
+    public function identifyByHashes(array $hashesByKey): array
     {
-        return Cache::remember("mclibrarymgr:curseforge:identify:{$sha1}", self::CACHE_TTL, function () use ($sha1) {
-            try {
-                $response = $this->http->post('fingerprints/432', [
-                    'json' => ['fingerprints' => [(int) hexdec(substr($sha1, 0, 8))]],
-                ]);
-                $matches = json_decode($response->getBody()->getContents(), true)['data']['exactMatches'] ?? [];
+        $result = array_fill_keys(array_keys($hashesByKey), null);
+        if (!$hashesByKey) {
+            return $result;
+        }
 
-                if (empty($matches)) {
-                    return null;
-                }
+        $fingerprintByKey = array_map(fn ($sha1) => (int) hexdec(substr($sha1, 0, 8)), $hashesByKey);
 
-                $modId = $matches[0]['id'];
-                $mod = json_decode($this->http->get("mods/{$modId}")->getBody()->getContents(), true)['data'];
+        try {
+            $matches = json_decode($this->http->post('fingerprints/432', [
+                'json' => ['fingerprints' => array_values(array_unique($fingerprintByKey))],
+            ])->getBody()->getContents(), true)['data']['exactMatches'] ?? [];
 
-                return [
+            $modIdByFingerprint = [];
+            foreach ($matches as $match) {
+                $modIdByFingerprint[$match['file']['fileFingerprint']] = $match['id'];
+            }
+
+            $modIds = array_values(array_unique($modIdByFingerprint));
+            if (!$modIds) {
+                return $result;
+            }
+
+            $modsById = array_column(
+                json_decode($this->http->post('mods', [
+                    'json' => ['modIds' => $modIds],
+                ])->getBody()->getContents(), true)['data'],
+                null,
+                'id'
+            );
+        } catch (\Exception $exception) {
+            return $result;
+        }
+
+        foreach ($fingerprintByKey as $key => $fingerprint) {
+            $mod = $modsById[$modIdByFingerprint[$fingerprint] ?? null] ?? null;
+            if ($mod) {
+                $result[$key] = [
                     'project_id' => (string) $mod['id'],
                     'slug' => $mod['slug'],
                     'title' => $mod['name'],
@@ -173,10 +195,10 @@ class CurseForgeProvider implements LibraryProvider
                     'icon_url' => $mod['logo']['url'] ?? null,
                     'downloads' => $mod['downloadCount'],
                 ];
-            } catch (\Exception $exception) {
-                return null;
             }
-        });
+        }
+
+        return $result;
     }
 
     public function searchModpacks(array $params): array

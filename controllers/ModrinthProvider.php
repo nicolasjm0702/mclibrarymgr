@@ -99,21 +99,38 @@ class ModrinthProvider implements LibraryProvider
         return $file;
     }
 
-    public function identifyByHash(string $sha1): ?array
+    public function identifyByHashes(array $hashesByKey): array
     {
-        return Cache::remember("mclibrarymgr:modrinth:identify:{$sha1}", self::CACHE_TTL, function () use ($sha1) {
-            try {
-                $version = json_decode(
-                    $this->http->get("version_file/{$sha1}", ['query' => ['algorithm' => 'sha1']])->getBody()->getContents(),
-                    true
-                );
+        $result = array_fill_keys(array_keys($hashesByKey), null);
+        if (!$hashesByKey) {
+            return $result;
+        }
 
-                $project = json_decode(
-                    $this->http->get("project/{$version['project_id']}")->getBody()->getContents(),
-                    true
-                );
+        try {
+            $versionsByHash = json_decode($this->http->post('version_files', [
+                'json' => ['hashes' => array_values($hashesByKey), 'algorithm' => 'sha1'],
+            ])->getBody()->getContents(), true);
 
-                return [
+            $projectIds = array_values(array_unique(array_column($versionsByHash, 'project_id')));
+            if (!$projectIds) {
+                return $result;
+            }
+
+            $projectsById = array_column(
+                json_decode($this->http->get('projects', [
+                    'query' => ['ids' => json_encode($projectIds)],
+                ])->getBody()->getContents(), true),
+                null,
+                'id'
+            );
+        } catch (\Exception $exception) {
+            return $result;
+        }
+
+        foreach ($hashesByKey as $key => $hash) {
+            $project = $projectsById[$versionsByHash[$hash]['project_id'] ?? null] ?? null;
+            if ($project) {
+                $result[$key] = [
                     'project_id' => $project['id'],
                     'slug' => $project['slug'],
                     'title' => $project['title'],
@@ -121,10 +138,10 @@ class ModrinthProvider implements LibraryProvider
                     'icon_url' => $project['icon_url'],
                     'downloads' => $project['downloads'],
                 ];
-            } catch (\Exception $exception) {
-                return null;
             }
-        });
+        }
+
+        return $result;
     }
 
     public function searchModpacks(array $params): array
