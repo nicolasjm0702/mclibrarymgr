@@ -1,0 +1,4 @@
+*.blueprint
+/docs
+.claude
+AGENTS.md

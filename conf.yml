@@ -1,0 +1,22 @@
+info:
+  name: "Minecraft Library Manager"
+  identifier: "mclibrarymgr"
+  description: "Search and install mods, plugins, datapacks and resource packs from Modrinth or CurseForge without leaving the panel."
+  version: "1.0"
+  target: "beta-2026-08"
+  author: "nicolasjm0702"
+
+admin:
+  view: "admin/view.blade.php"
+  controller: "admin/controller.php"
+
+dashboard:
+  components: "components"
+
+requests:
+  app: "controllers"
+  routers:
+    client: "routes/client.php"
+
+database:
+  migrations: "migrations"

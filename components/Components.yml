@@ -1,0 +1,10 @@
+Navigation:
+  Routes:
+    - Name: "Library"
+      Path: "/library"
+      Type: "server"
+      Component: "Library"
+    - Name: "Modpack"
+      Path: "/modpack"
+      Type: "server"
+      Component: "Modpack"
