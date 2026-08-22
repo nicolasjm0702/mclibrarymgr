@@ -175,32 +175,6 @@ const HitCard = ({
     </div>
 );
 
-const PlainFileRow = ({
-    file,
-    action,
-}: {
-    file: InstalledFile;
-    action: React.ReactNode;
-}) => (
-    <div
-        css={{
-            display: "flex",
-            justifyContent: "space-between",
-            alignItems: "center",
-            fontSize: "0.85rem",
-            padding: "0.35rem 0.6rem",
-            borderRadius: "0.25rem",
-            backgroundColor: "rgba(255, 255, 255, 0.03)",
-        }}
-    >
-        <span>{file.name}</span>
-        <div css={{ display: "flex", alignItems: "center", gap: "0.75rem" }}>
-            <span css={{ opacity: 0.6 }}>{formatSize(file.size)}</span>
-            {action}
-        </div>
-    </div>
-);
-
 const detectLoaderAndType = (
     dockerImage: string,
     invocation: string,
@@ -500,41 +474,103 @@ export default () => {
         setIdentified({});
     }, [type]);
 
+    const identifiedRef = useRef(identified);
     useEffect(() => {
-        const pending = installedFiles
-            .map((f) => f.name)
-            .filter((name) => !(name in identified));
-        if (pending.length === 0) return;
+        identifiedRef.current = identified;
+    }, [identified]);
 
-        let cancelled = false;
+    const installedFilesRef = useRef(installedFiles);
+    useEffect(() => {
+        installedFilesRef.current = installedFiles;
+    }, [installedFiles]);
 
-        http.post(
-            `/api/client/extensions/mclibrarymgr/servers/${uuid}/identify-batch`,
-            { type, filenames: pending },
-        )
-            .then(({ data }) => {
-                if (cancelled) return;
-                const results = data.results ?? {};
-                setIdentified((prev) => ({
-                    ...prev,
-                    ...Object.fromEntries(
-                        pending.map((name) => [name, results[name] ?? null]),
-                    ),
-                }));
-            })
-            .catch(() => {
-                if (cancelled) return;
-                setIdentified((prev) => ({
-                    ...prev,
-                    ...Object.fromEntries(pending.map((name) => [name, null])),
-                }));
-            });
+    const rowObserverRef = useRef<IntersectionObserver | null>(null);
+    const rowRefCallbacksRef = useRef<Map<string, (el: HTMLElement | null) => void>>(
+        new Map(),
+    );
+    const rowElementsRef = useRef<Map<string, HTMLElement>>(new Map());
+
+    useEffect(() => {
+        rowRefCallbacksRef.current = new Map();
+        rowElementsRef.current = new Map();
+
+        const CHUNK_SIZE = 15;
+        let flushTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const flush = () => {
+            const pendingNames = installedFilesRef.current
+                .map((f) => f.name)
+                .filter((name) => !(name in identifiedRef.current));
+            if (pendingNames.length === 0) return;
+
+            const chunk = pendingNames.slice(0, CHUNK_SIZE);
+
+            for (const name of chunk) {
+                const el = rowElementsRef.current.get(name);
+                if (el) observer.unobserve(el);
+            }
+
+            http.post(
+                `/api/client/extensions/mclibrarymgr/servers/${uuid}/identify-batch`,
+                { type, filenames: chunk },
+            )
+                .then(({ data }) => {
+                    const results = data.results ?? {};
+                    setIdentified((prev) => ({
+                        ...prev,
+                        ...Object.fromEntries(
+                            chunk.map((name) => [name, results[name] ?? null]),
+                        ),
+                    }));
+                })
+                .catch(() => {
+                    setIdentified((prev) => ({
+                        ...prev,
+                        ...Object.fromEntries(chunk.map((name) => [name, null])),
+                    }));
+                });
+        };
+
+        const observer = new IntersectionObserver(
+            (entries) => {
+                const sawNew = entries.some((entry) => {
+                    if (!entry.isIntersecting) return false;
+                    const filename = (entry.target as HTMLElement).dataset
+                        .filename;
+                    return !!filename && !(filename in identifiedRef.current);
+                });
+
+                if (!sawNew) return;
+                if (flushTimer) clearTimeout(flushTimer);
+                // Debounce so a fast scroll settles before grabbing the chunk.
+                flushTimer = setTimeout(flush, 150);
+            },
+            { rootMargin: "200px" },
+        );
+        rowObserverRef.current = observer;
 
         return () => {
-            cancelled = true;
+            observer.disconnect();
+            if (flushTimer) clearTimeout(flushTimer);
         };
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [installedFiles]);
+    }, [type, uuid]);
+
+    const getRowRefCallback = (filename: string) => {
+        const cache = rowRefCallbacksRef.current;
+        let callback = cache.get(filename);
+        if (!callback) {
+            callback = (el) => {
+                if (el) {
+                    el.dataset.filename = filename;
+                    rowElementsRef.current.set(filename, el);
+                    rowObserverRef.current?.observe(el);
+                }
+            };
+            cache.set(filename, callback);
+        }
+        return callback;
+    };
 
     const doInstall = (hit: ModrinthHit, params: Record<string, string>) => {
         setInstalling((v) => ({ ...v, [hit.project_id]: true }));
@@ -858,20 +894,35 @@ export default () => {
                                             Uninstall
                                         </Button>
                                     );
-                                    return hit ? (
-                                        <HitCard
+                                    const displayHit = hit ?? {
+                                        project_id: f.name,
+                                        slug: "",
+                                        title: f.name,
+                                        description:
+                                            hit === null
+                                                ? "Not found on this source."
+                                                : "Looking up details…",
+                                        project_type: type,
+                                        icon_url: null,
+                                        downloads: 0,
+                                    };
+
+                                    return (
+                                        <div
                                             key={f.name}
-                                            hit={hit}
-                                            sizeLabel={formatSize(f.size)}
-                                            action={deleteButton}
-                                            provider={provider}
-                                        />
-                                    ) : (
-                                        <PlainFileRow
-                                            key={f.name}
-                                            file={f}
-                                            action={deleteButton}
-                                        />
+                                            ref={
+                                                hit === undefined
+                                                    ? getRowRefCallback(f.name)
+                                                    : undefined
+                                            }
+                                        >
+                                            <HitCard
+                                                hit={displayHit}
+                                                sizeLabel={formatSize(f.size)}
+                                                action={deleteButton}
+                                                provider={hit ? provider : undefined}
+                                            />
+                                        </div>
                                     );
                                 })}
                             </div>
