@@ -124,6 +124,19 @@ class LibraryController extends Controller
             return new JsonResponse(['message' => "Unknown type: {$type}"], 422);
         }
 
+        if ($type === 'resourcepack') {
+            $record = $this->blueprint->dbGet('mclibrarymgr', "resourcepack:{$server->uuid}", null);
+            if ($record === null) {
+                return new JsonResponse(['files' => []]);
+            }
+
+            return new JsonResponse(['files' => [[
+                'name' => $record['filename'],
+                'size' => 0,
+                'project_id' => $record['project_id'] ?? null,
+            ]]]);
+        }
+
         try {
             $entries = $this->fileRepository->setServer($server)->getDirectory(self::FOLDERS[$type]);
         } catch (\Exception $exception) {
@@ -134,6 +147,26 @@ class LibraryController extends Controller
         $files = array_values(array_filter($entries, fn ($entry) => $entry['file'] ?? false));
 
         return new JsonResponse(['files' => $files]);
+    }
+
+    public function details(Request $request): JsonResponse
+    {
+        if ($response = $this->guardEnabled()) {
+            return $response;
+        }
+
+        if (!$this->providerReady) {
+            return new JsonResponse(['message' => LibraryProviderRegistry::label($this->providerName) . ' API key not configured.'], 502);
+        }
+
+        $projectId = $request->query('project_id');
+        $info = $projectId ? $this->provider->projectInfo($projectId) : null;
+
+        if ($info === null) {
+            return new JsonResponse(['message' => 'Project not found.'], 404);
+        }
+
+        return new JsonResponse($info);
     }
 
     public function identifyBatch(Request $request, Server $server): JsonResponse
@@ -151,6 +184,10 @@ class LibraryController extends Controller
             return new JsonResponse(['message' => "Unknown type: {$type}"], 422);
         }
 
+        if ($type === 'resourcepack') {
+            return new JsonResponse(['message' => 'Resource packs are identified directly, not by hash.'], 422);
+        }
+
         $repository = $this->fileRepository->setServer($server);
 
         $hashesByFilename = [];
@@ -166,10 +203,42 @@ class LibraryController extends Controller
 
         $results = $this->provider->identifyByHashes($hashesByFilename);
 
+        $loaders = $request->input('loaders', '');
+        $version = $request->input('version');
+
         foreach ($results as $filename => $project) {
-            if ($project !== null) {
-                $results[$filename]['project_type'] = $type;
+            if ($project === null) {
+                continue;
             }
+
+            $results[$filename]['project_type'] = $type;
+            $results[$filename]['has_update'] = false;
+            $results[$filename]['latest_version'] = null;
+
+            try {
+                $versions = $this->provider->projectVersions($project['project_id'], [
+                    'loaders' => $loaders,
+                    'version' => $version,
+                ]);
+            } catch (\Exception $exception) {
+                continue; // Best-effort — an update check failure shouldn't break identify.
+            }
+
+            $latest = $versions[0] ?? null;
+            if ($latest === null) {
+                continue;
+            }
+
+            $installedHash = $hashesByFilename[$filename] ?? null;
+            $latestHashes = array_column($latest['files'] ?? [], 'sha1');
+            // No sha1 on CurseForge's projectVersions files array unless
+            // resolveInstallFile filled it in — Modrinth's files always carry it.
+            $latestHashes = array_filter($latestHashes);
+
+            $results[$filename]['has_update'] = $installedHash !== null
+                && $latestHashes !== []
+                && !in_array($installedHash, $latestHashes, true);
+            $results[$filename]['latest_version'] = $latest['version_number'] ?? null;
         }
 
         return new JsonResponse(['results' => $results]);
@@ -186,6 +255,13 @@ class LibraryController extends Controller
             return new JsonResponse(['message' => "Unknown type: {$type}"], 422);
         }
 
+        if ($type === 'resourcepack') {
+            $this->configureResourcePack($server, null, null);
+            $this->blueprint->dbSet('mclibrarymgr', "resourcepack:{$server->uuid}", null);
+
+            return new JsonResponse(['message' => 'ok']);
+        }
+
         $filename = $request->input('filename');
 
         if ($type === 'datapack') {
@@ -198,14 +274,6 @@ class LibraryController extends Controller
             $this->fileRepository->setServer($server)->deleteFiles(self::FOLDERS[$type], [$filename]);
         } catch (\Exception $exception) {
             return new JsonResponse(['message' => $exception->getMessage()], 502);
-        }
-
-        if ($type === 'resourcepack') {
-            $record = $this->blueprint->dbGet('mclibrarymgr', "resourcepack:{$server->uuid}", null);
-            if ($record && ($record['filename'] ?? null) === $filename) {
-                $this->configureResourcePack($server, null, null);
-                $this->blueprint->dbSet('mclibrarymgr', "resourcepack:{$server->uuid}", null);
-            }
         }
 
         return new JsonResponse(['message' => 'ok']);
@@ -239,6 +307,20 @@ class LibraryController extends Controller
             return new JsonResponse(['message' => $exception->getMessage()], 404);
         }
 
+        if ($type === 'resourcepack') {
+            if (empty($file['url'])) {
+                return new JsonResponse(['message' => 'This resource pack is not available for direct download from its source.'], 502);
+            }
+
+            $this->configureResourcePack($server, $file['url'], $file['sha1'] ?? null);
+            $this->blueprint->dbSet('mclibrarymgr', "resourcepack:{$server->uuid}", [
+                'project_id' => $request->input('project_id'),
+                'filename' => $file['filename'],
+            ]);
+
+            return new JsonResponse(['message' => 'ok', 'warning' => null]);
+        }
+
         try {
             $this->fileRepository->setServer($server)->pull($file['url'], self::FOLDERS[$type], [
                 'filename' => $file['filename'],
@@ -247,29 +329,13 @@ class LibraryController extends Controller
             return new JsonResponse(['message' => $exception->getMessage()], 502);
         }
 
-        $warning = null;
-        if ($type === 'resourcepack') {
-            $previous = $this->blueprint->dbGet('mclibrarymgr', "resourcepack:{$server->uuid}", null);
-            if ($previous && ($previous['filename'] ?? null) !== $file['filename']) {
-                // Vanilla's server.properties only holds one resource-pack —
-                // it can't be told to send several. Installing a new one
-                // silently replaces whichever was previously configured.
-                $warning = "A Minecraft server can only push one resource pack to clients — \"{$file['filename']}\" replaces \"{$previous['filename']}\" as the active one. Both files stay on disk, but only the new one is sent.";
-            }
-
-            $this->configureResourcePack($server, $file['url'], $file['sha1'] ?? null);
-            $this->blueprint->dbSet('mclibrarymgr', "resourcepack:{$server->uuid}", [
-                'filename' => $file['filename'],
-            ]);
-        }
-
         if ($type === 'datapack') {
             // pull() downloads in the background
             sleep(2);
             $this->tryDatapackCommand($server, 'enable', $file['filename']);
         }
 
-        return new JsonResponse(['message' => 'ok', 'warning' => $warning]);
+        return new JsonResponse(['message' => 'ok', 'warning' => null]);
     }
 
     private function tryDatapackCommand(Server $server, string $action, string $filename): void

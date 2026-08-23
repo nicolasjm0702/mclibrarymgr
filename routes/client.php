@@ -9,6 +9,7 @@ Route::get('/servers/{server}/search', [mclibrarymgr\LibraryController::class, '
 Route::get('/servers/{server}/versions', [mclibrarymgr\LibraryController::class, 'versions']);
 Route::get('/servers/{server}/installed', [mclibrarymgr\LibraryController::class, 'installed']);
 Route::post('/servers/{server}/identify-batch', [mclibrarymgr\LibraryController::class, 'identifyBatch']);
+Route::get('/servers/{server}/details', [mclibrarymgr\LibraryController::class, 'details']);
 Route::post('/servers/{server}/install', [mclibrarymgr\LibraryController::class, 'install']);
 Route::delete('/servers/{server}/uninstall', [mclibrarymgr\LibraryController::class, 'uninstall']);
 

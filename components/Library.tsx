@@ -6,38 +6,18 @@ import Input from "@/components/elements/Input";
 import Spinner from "@/components/elements/Spinner";
 import { Dialog } from "@/components/elements/dialog";
 import FlashMessageRender from "@/components/FlashMessageRender";
-import {
-    SearchIcon,
-    ChevronDownIcon,
-    ChevronRightIcon,
-} from "@heroicons/react/solid";
+import { SearchIcon, DownloadIcon, TrashIcon } from "@heroicons/react/solid";
 import useFlash from "@/plugins/useFlash";
 import http from "@/api/http";
-import SourceSelector, { Source, sourceProjectUrl } from "./SourceSelector";
+import { Source } from "./SourceSelector";
 import Pagination from "./Pagination";
-
-interface ModrinthHit {
-    project_id: string;
-    slug: string;
-    title: string;
-    description: string;
-    project_type: string;
-    icon_url: string | null;
-    author?: string;
-    downloads: number;
-}
-
-interface InstalledFile {
-    name: string;
-    size: number;
-}
-
-interface ModrinthVersion {
-    id: string;
-    version_number: string;
-    game_versions: string[];
-    loaders: string[];
-}
+import { Hit, Version, InstalledEntry, ProjectDetails } from "./library/types";
+import { formatSize } from "./library/format";
+import useServerFilters from "./library/useServerFilters";
+import BrowseCard from "./library/BrowseCard";
+import ManageRow from "./library/ManageRow";
+import VersionDialog from "./library/VersionDialog";
+import DetailsDialog from "./library/DetailsDialog";
 
 const PROJECT_TYPES = ["mod", "plugin", "datapack", "resourcepack"];
 
@@ -63,117 +43,6 @@ const LOADERS_BY_TYPE: Record<string, string[]> = {
     datapack: [],
     resourcepack: [],
 };
-
-const formatDownloads = (n: number) => {
-    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-    return `${n}`;
-};
-
-const formatSize = (bytes: number) => {
-    if (bytes >= 1_048_576) return `${(bytes / 1_048_576).toFixed(1)} MB`;
-    if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-    return `${bytes} B`;
-};
-
-const HitCard = ({
-    hit,
-    action,
-    sizeLabel,
-    provider,
-}: {
-    hit: ModrinthHit;
-    action: React.ReactNode;
-    sizeLabel?: string;
-    provider?: string;
-}) => (
-    <div
-        css={{
-            display: "flex",
-            alignItems: "center",
-            gap: "1rem",
-            padding: "1rem",
-            borderRadius: "0.5rem",
-            backgroundColor: "rgba(255, 255, 255, 0.04)",
-        }}
-    >
-        {hit.icon_url ? (
-            <img
-                src={hit.icon_url}
-                alt={hit.title}
-                css={{
-                    width: "56px",
-                    height: "56px",
-                    borderRadius: "0.375rem",
-                    flexShrink: 0,
-                }}
-            />
-        ) : (
-            <div
-                css={{
-                    width: "56px",
-                    height: "56px",
-                    borderRadius: "0.375rem",
-                    flexShrink: 0,
-                    backgroundColor: "rgba(255, 255, 255, 0.08)",
-                }}
-            />
-        )}
-
-        <div css={{ flex: 1, minWidth: 0 }}>
-            <div css={{ fontWeight: 600 }}>
-                {provider ? (
-                    <a
-                        href={sourceProjectUrl(provider, hit)}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        css={{
-                            color: "inherit",
-                            "&:hover": { textDecoration: "underline" },
-                        }}
-                    >
-                        {hit.title}
-                    </a>
-                ) : (
-                    hit.title
-                )}
-            </div>
-            <div
-                css={{
-                    fontSize: "0.85rem",
-                    opacity: 0.7,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                }}
-            >
-                {hit.description}
-            </div>
-            <div
-                css={{
-                    fontSize: "0.75rem",
-                    opacity: 0.5,
-                    marginTop: "0.25rem",
-                }}
-            >
-                {hit.author && <>by {hit.author} &middot; </>}
-                {formatDownloads(hit.downloads)} downloads
-                {sizeLabel && <> &middot; {sizeLabel}</>}
-            </div>
-        </div>
-
-        <div
-            css={{
-                display: "flex",
-                alignItems: "center",
-                gap: "0.5rem",
-                flexShrink: 0,
-            }}
-        >
-            {action}
-        </div>
-    </div>
-);
 
 const detectLoaderAndType = (
     dockerImage: string,
@@ -267,39 +136,55 @@ export default () => {
     );
     const { addFlash, clearFlashes } = useFlash();
 
+    const {
+        loaders,
+        version: gameVersion,
+        setLoaders,
+        setVersion: setGameVersion,
+        hasStored,
+    } = useServerFilters(uuid);
+
+    const [activeTab, setActiveTab] = useState<"browse" | "manage">("manage");
+    const [detailsProjectId, setDetailsProjectId] = useState<string | null>(null);
+    const [details, setDetails] = useState<ProjectDetails | null>(null);
+    const [loadingDetails, setLoadingDetails] = useState(false);
+
     const [query, setQuery] = useState("");
     const [activeQuery, setActiveQuery] = useState("");
     const [type, setType] = useState("mod");
-    const [loaders, setLoaders] = useState<string[]>([]);
-    const [gameVersion, setGameVersion] = useState("");
     const [gameVersions, setGameVersions] = useState<string[]>([]);
-    const [results, setResults] = useState<ModrinthHit[]>([]);
+    const [results, setResults] = useState<Hit[]>([]);
     const [totalHits, setTotalHits] = useState(0);
     const [page, setPage] = useState(1);
     const [installing, setInstalling] = useState<Record<string, boolean>>({});
-    const [pendingHit, setPendingHit] = useState<ModrinthHit | null>(null);
+    const [pendingHit, setPendingHit] = useState<Hit | null>(null);
     const [searching, setSearching] = useState(false);
-    const [installedFiles, setInstalledFiles] = useState<InstalledFile[]>([]);
+    const [installedFiles, setInstalledFiles] = useState<InstalledEntry[]>([]);
     const [loadingInstalled, setLoadingInstalled] = useState(false);
-    const [installedCollapsed, setInstalledCollapsed] = useState(false);
-    const [identified, setIdentified] = useState<
-        Record<string, ModrinthHit | null>
+    const [identified, setIdentified] = useState<Record<string, Hit | null>>(
+        {},
+    );
+    const [updateInfo, setUpdateInfo] = useState<
+        Record<string, { has_update: boolean; latest_version: string | null }>
     >({});
     const [uninstalling, setUninstalling] = useState<Record<string, boolean>>(
         {},
     );
     const [confirmUninstall, setConfirmUninstall] =
-        useState<InstalledFile | null>(null);
+        useState<InstalledEntry | null>(null);
     const [justInstalled, setJustInstalled] = useState<Record<string, boolean>>(
         {},
     );
-    const [pendingVersions, setPendingVersions] = useState<ModrinthVersion[]>(
-        [],
-    );
+    const [pendingVersions, setPendingVersions] = useState<Version[]>([]);
     const [loadingPendingVersions, setLoadingPendingVersions] = useState(false);
     const [provider, setProvider] = useState("modrinth");
     const [sources, setSources] = useState<Source[]>([]);
     const [enabled, setEnabled] = useState(true);
+    const [updateTarget, setUpdateTarget] = useState<{
+        file: InstalledEntry;
+        hit: Hit | null;
+    } | null>(null);
+    const [updatingFile, setUpdatingFile] = useState<string | null>(null);
     const searchSeqRef = useRef(0);
 
     useEffect(() => {
@@ -324,6 +209,8 @@ export default () => {
         ).then(({ data }) => {
             const validVersions: string[] = data.versions ?? [];
             setGameVersions(validVersions);
+
+            if (hasStored()) return;
 
             const asRealVersion = (version: string | null) =>
                 version && validVersions.includes(version) ? version : null;
@@ -388,7 +275,18 @@ export default () => {
                 params: { type: forType },
             },
         )
-            .then(({ data }) => setInstalledFiles(data.files ?? []))
+            .then(({ data }) => {
+                const files: InstalledEntry[] = data.files ?? [];
+                setInstalledFiles(files);
+                identifyInstalledFiles(forType, files);
+            })
+            .catch((error) =>
+                addFlash({
+                    key: "library",
+                    type: "error",
+                    message: error?.response?.data?.message || error.message,
+                }),
+            )
             .finally(() => setLoadingInstalled(false));
     };
 
@@ -472,6 +370,7 @@ export default () => {
 
     useEffect(() => {
         setIdentified({});
+        setUpdateInfo({});
     }, [type]);
 
     const identifiedRef = useRef(identified);
@@ -479,40 +378,55 @@ export default () => {
         identifiedRef.current = identified;
     }, [identified]);
 
-    const installedFilesRef = useRef(installedFiles);
+    const loadersRef = useRef(loaders);
     useEffect(() => {
-        installedFilesRef.current = installedFiles;
-    }, [installedFiles]);
+        loadersRef.current = loaders;
+    }, [loaders]);
 
-    const rowObserverRef = useRef<IntersectionObserver | null>(null);
-    const rowRefCallbacksRef = useRef<Map<string, (el: HTMLElement | null) => void>>(
-        new Map(),
-    );
-    const rowElementsRef = useRef<Map<string, HTMLElement>>(new Map());
+    const gameVersionRef = useRef(gameVersion);
+    useEffect(() => {
+        gameVersionRef.current = gameVersion;
+    }, [gameVersion]);
 
     useEffect(() => {
-        rowRefCallbacksRef.current = new Map();
-        rowElementsRef.current = new Map();
+        if (type !== "resourcepack") return;
+        const file = installedFiles[0];
+        if (!file) return;
+        if (file.name in identifiedRef.current) return;
+
+        if (!file.project_id) {
+            setIdentified((prev) => ({ ...prev, [file.name]: null }));
+            return;
+        }
+
+        http.get(
+            `/api/client/extensions/mclibrarymgr/servers/${uuid}/details`,
+            { params: { project_id: file.project_id } },
+        )
+            .then(({ data }) => setIdentified((prev) => ({ ...prev, [file.name]: data })))
+            .catch(() => setIdentified((prev) => ({ ...prev, [file.name]: null })));
+    }, [type, uuid, installedFiles]);
+
+    const identifyInstalledFiles = (forType: string, files: InstalledEntry[]) => {
+        if (forType === "resourcepack") return;
 
         const CHUNK_SIZE = 15;
-        let flushTimer: ReturnType<typeof setTimeout> | null = null;
+        const pendingNames = files
+            .map((f) => f.name)
+            .filter((name) => !(name in identifiedRef.current));
 
-        const flush = () => {
-            const pendingNames = installedFilesRef.current
-                .map((f) => f.name)
-                .filter((name) => !(name in identifiedRef.current));
-            if (pendingNames.length === 0) return;
-
-            const chunk = pendingNames.slice(0, CHUNK_SIZE);
-
-            for (const name of chunk) {
-                const el = rowElementsRef.current.get(name);
-                if (el) observer.unobserve(el);
-            }
+        const runChunk = (start: number) => {
+            if (start >= pendingNames.length) return;
+            const chunk = pendingNames.slice(start, start + CHUNK_SIZE);
 
             http.post(
                 `/api/client/extensions/mclibrarymgr/servers/${uuid}/identify-batch`,
-                { type, filenames: chunk },
+                {
+                    type: forType,
+                    filenames: chunk,
+                    loaders: loadersRef.current.join(","),
+                    version: gameVersionRef.current,
+                },
             )
                 .then(({ data }) => {
                     const results = data.results ?? {};
@@ -522,57 +436,33 @@ export default () => {
                             chunk.map((name) => [name, results[name] ?? null]),
                         ),
                     }));
+                    const updates: Record<
+                        string,
+                        { has_update: boolean; latest_version: string | null }
+                    > = {};
+                    chunk.forEach((name) => {
+                        if (results[name]) {
+                            updates[name] = {
+                                has_update: !!results[name].has_update,
+                                latest_version: results[name].latest_version ?? null,
+                            };
+                        }
+                    });
+                    setUpdateInfo((prev) => ({ ...prev, ...updates }));
                 })
                 .catch(() => {
                     setIdentified((prev) => ({
                         ...prev,
                         ...Object.fromEntries(chunk.map((name) => [name, null])),
                     }));
-                });
+                })
+                .finally(() => runChunk(start + CHUNK_SIZE));
         };
 
-        const observer = new IntersectionObserver(
-            (entries) => {
-                const sawNew = entries.some((entry) => {
-                    if (!entry.isIntersecting) return false;
-                    const filename = (entry.target as HTMLElement).dataset
-                        .filename;
-                    return !!filename && !(filename in identifiedRef.current);
-                });
-
-                if (!sawNew) return;
-                if (flushTimer) clearTimeout(flushTimer);
-                // Debounce so a fast scroll settles before grabbing the chunk.
-                flushTimer = setTimeout(flush, 150);
-            },
-            { rootMargin: "200px" },
-        );
-        rowObserverRef.current = observer;
-
-        return () => {
-            observer.disconnect();
-            if (flushTimer) clearTimeout(flushTimer);
-        };
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [type, uuid]);
-
-    const getRowRefCallback = (filename: string) => {
-        const cache = rowRefCallbacksRef.current;
-        let callback = cache.get(filename);
-        if (!callback) {
-            callback = (el) => {
-                if (el) {
-                    el.dataset.filename = filename;
-                    rowElementsRef.current.set(filename, el);
-                    rowObserverRef.current?.observe(el);
-                }
-            };
-            cache.set(filename, callback);
-        }
-        return callback;
+        runChunk(0);
     };
 
-    const doInstall = (hit: ModrinthHit, params: Record<string, string>) => {
+    const doInstall = (hit: Hit, params: Record<string, string>) => {
         setInstalling((v) => ({ ...v, [hit.project_id]: true }));
         clearFlashes("library");
         http.post(
@@ -608,7 +498,7 @@ export default () => {
             );
     };
 
-    const install = (hit: ModrinthHit) => {
+    const install = (hit: Hit) => {
         setPendingHit(hit);
         setLoadingPendingVersions(true);
         http.get(`/api/client/extensions/mclibrarymgr/servers/${uuid}/search`, {
@@ -625,7 +515,7 @@ export default () => {
             .finally(() => setLoadingPendingVersions(false));
     };
 
-    const installVersion = (hit: ModrinthHit, version: ModrinthVersion) => {
+    const installVersion = (hit: Hit, version: Version) => {
         setPendingHit(null);
         doInstall(hit, { version_id: version.id });
     };
@@ -668,7 +558,110 @@ export default () => {
             );
     };
 
-    const matchesCurrentFilters = (v: ModrinthVersion) =>
+    const openUpdateDialog = (file: InstalledEntry, hit: Hit | null | undefined) => {
+        setUpdateTarget({ file, hit: hit ?? null });
+        setPendingHit(
+            hit ?? {
+                project_id: file.project_id ?? "",
+                slug: "",
+                title: file.name,
+                description: "",
+                project_type: type,
+                icon_url: null,
+                downloads: 0,
+                likes: 0,
+            },
+        );
+        setLoadingPendingVersions(true);
+        http.get(`/api/client/extensions/mclibrarymgr/servers/${uuid}/search`, {
+            params: { project_id: hit?.project_id ?? file.project_id },
+        })
+            .then(({ data }) => setPendingVersions(data.versions ?? []))
+            .catch((error) =>
+                addFlash({
+                    key: "library",
+                    type: "error",
+                    message: error?.response?.data?.message || error.message,
+                }),
+            )
+            .finally(() => setLoadingPendingVersions(false));
+    };
+
+    const applyUpdate = (version: Version) => {
+        if (!updateTarget) return;
+        const { file } = updateTarget;
+        setPendingHit(null);
+        setUpdateTarget(null);
+        setUpdatingFile(file.name);
+        clearFlashes("library");
+
+        const cleanup = () => setUpdatingFile(null);
+
+        if (type === "resourcepack") {
+            // No old file to remove — installing just overwrites server.properties.
+            doInstall(
+                {
+                    project_id: file.project_id ?? "",
+                    slug: "",
+                    title: file.name,
+                    description: "",
+                    project_type: type,
+                    icon_url: null,
+                    downloads: 0,
+                    likes: 0,
+                },
+                { version_id: version.id },
+            );
+            cleanup();
+            return;
+        }
+
+        http.delete(`/api/client/extensions/mclibrarymgr/servers/${uuid}/uninstall`, {
+            data: { type, filename: file.name },
+        })
+            .then(() =>
+                doInstall(
+                    {
+                        project_id: updateTarget.hit?.project_id ?? "",
+                        slug: "",
+                        title: file.name,
+                        description: "",
+                        project_type: type,
+                        icon_url: null,
+                        downloads: 0,
+                        likes: 0,
+                    },
+                    { version_id: version.id },
+                ),
+            )
+            .catch((error) =>
+                addFlash({
+                    key: "library",
+                    type: "error",
+                    message: error?.response?.data?.message || error.message,
+                }),
+            )
+            .finally(cleanup);
+    };
+
+    const openDetails = (projectId: string) => {
+        setDetailsProjectId(projectId);
+        setLoadingDetails(true);
+        http.get(`/api/client/extensions/mclibrarymgr/servers/${uuid}/details`, {
+            params: { project_id: projectId },
+        })
+            .then(({ data }) => setDetails(data))
+            .catch((error) =>
+                addFlash({
+                    key: "library",
+                    type: "error",
+                    message: error?.response?.data?.message || error.message,
+                }),
+            )
+            .finally(() => setLoadingDetails(false));
+    };
+
+    const matchesCurrentFilters = (v: Version) =>
         (!gameVersion || v.game_versions.includes(gameVersion)) &&
         (loaders.length === 0 || v.loaders.some((l) => loaders.includes(l)));
 
@@ -680,7 +673,7 @@ export default () => {
 
     const installedFileByProjectId = (
         projectId: string,
-    ): InstalledFile | undefined => {
+    ): InstalledEntry | undefined => {
         const filename = Object.entries(identified).find(
             ([, h]) => h?.project_id === projectId,
         )?.[0];
@@ -699,6 +692,12 @@ export default () => {
         );
     }
 
+    const isPicking = updateTarget
+        ? !!updatingFile
+        : pendingHit
+          ? !!installing[pendingHit.project_id]
+          : false;
+
     return (
         <div css={{ padding: "1rem", maxWidth: "900px", margin: "0 auto" }}>
             <FlashMessageRender
@@ -706,389 +705,261 @@ export default () => {
                 css={{ marginBottom: "1rem" }}
             />
 
-            <SourceSelector
-                provider={provider}
-                sources={sources}
-                onChange={changeProvider}
-            />
-
-            <div
-                css={{
-                    fontSize: "0.75rem",
-                    opacity: 0.6,
-                    marginBottom: "0.35rem",
-                }}
-            >
-                Type
-            </div>
-            <div
-                css={{
-                    display: "flex",
-                    gap: "0.25rem",
-                    marginBottom: "1.5rem",
-                    flexWrap: "wrap",
-                }}
-            >
-                {PROJECT_TYPES.map((t) => (
-                    <button
-                        key={t}
-                        type="button"
-                        onClick={() => {
-                            setType(t);
-                            setLoaders([]);
-                        }}
-                        className={`px-4 py-2 rounded-full border-0 cursor-pointer text-sm font-semibold ${
-                            type === t
-                                ? "bg-primary-500 text-primary-50"
-                                : "bg-transparent text-neutral-300"
-                        }`}
-                    >
-                        {TYPE_LABELS[t]}
-                    </button>
-                ))}
-            </div>
-
-            <div
-                css={{
-                    fontSize: "0.75rem",
-                    opacity: 0.6,
-                    marginBottom: "0.35rem",
-                }}
-            >
-                Search filters
-            </div>
-            <div
-                css={{
-                    display: "flex",
-                    gap: "0.25rem",
-                    marginBottom: "1.5rem",
-                    flexWrap: "wrap",
-                }}
-            >
+            <div className="mb-4">
+                <div className="text-[0.65rem] uppercase tracking-wide opacity-60 mb-1">
+                    Platform
+                </div>
                 <Select
-                    css={{ width: "160px", flexShrink: 0 }}
-                    value={gameVersion}
-                    onChange={(e) => setGameVersion(e.currentTarget.value)}
+                    css={{ width: "160px" }}
+                    value={provider}
+                    onChange={(e) => changeProvider(e.currentTarget.value)}
                 >
-                    <option value="">Any version</option>
-                    {gameVersion && !gameVersions.includes(gameVersion) && (
-                        <option value={gameVersion}>{gameVersion}</option>
-                    )}
-                    {gameVersions.map((v) => (
-                        <option key={v} value={v}>
-                            {v}
+                    {sources.map(({ id, label, available }) => (
+                        <option key={id} value={id} disabled={!available}>
+                            {label}
+                            {available ? "" : " (not configured)"}
                         </option>
                     ))}
                 </Select>
-                <Input
-                    css={{ flex: 1 }}
-                    value={query}
-                    onChange={(e) => setQuery(e.currentTarget.value)}
-                    onKeyDown={(e) => e.key === "Enter" && search(query)}
-                    placeholder={`Search ${TYPE_LABELS[type].toLowerCase()}...`}
-                />
-                <Button
-                    onClick={() => search(query)}
-                    disabled={searching}
-                    aria-label="Search"
-                >
-                    <SearchIcon css={{ width: "1.1rem", height: "1.1rem" }} />
-                </Button>
             </div>
 
-            {LOADERS_BY_TYPE[type].length > 0 && (
-                <div css={{ marginBottom: "1.5rem" }}>
+            <div className="flex flex-wrap gap-3 mb-4">
+                <div className="flex gap-4 bg-white/[0.04] rounded-lg px-3 pt-2">
+                    {(["browse", "manage"] as const).map((tab) => (
+                        <button
+                            key={tab}
+                            type="button"
+                            onClick={() => setActiveTab(tab)}
+                            className={`pb-2 -mb-px border-0 border-b-2 bg-transparent cursor-pointer text-sm font-semibold capitalize ${
+                                activeTab === tab
+                                    ? "border-primary-500 text-primary-400"
+                                    : "border-transparent text-neutral-400"
+                            }`}
+                        >
+                            {tab}
+                        </button>
+                    ))}
+                </div>
+
+                <div className="flex gap-4 bg-white/[0.04] rounded-lg px-3 pt-2 flex-wrap">
+                    {PROJECT_TYPES.map((t) => (
+                        <button
+                            key={t}
+                            type="button"
+                            onClick={() => {
+                                setType(t);
+                                setLoaders([]);
+                            }}
+                            className={`pb-2 -mb-px border-0 border-b-2 bg-transparent cursor-pointer text-sm font-semibold ${
+                                type === t
+                                    ? "border-primary-500 text-primary-400"
+                                    : "border-transparent text-neutral-400"
+                            }`}
+                        >
+                            {TYPE_LABELS[t]}
+                        </button>
+                    ))}
+                </div>
+            </div>
+
+            {activeTab === "browse" && (
+                <>
+                    <div className="flex flex-col gap-3 bg-white/[0.04] rounded-lg p-3 mb-4">
+                        {LOADERS_BY_TYPE[type].length > 0 && (
+                            <div>
+                                <div className="text-[0.65rem] uppercase tracking-wide opacity-60 mb-1">
+                                    Loader
+                                </div>
+                                <div className="flex flex-wrap gap-x-3 gap-y-1">
+                                    {LOADERS_BY_TYPE[type].map((l) => (
+                                        <label
+                                            key={l}
+                                            className="flex items-center gap-1.5 text-sm"
+                                        >
+                                            <input
+                                                type="checkbox"
+                                                checked={loaders.includes(l)}
+                                                onChange={(e) => {
+                                                    const checked = e.currentTarget.checked;
+                                                    setLoaders(
+                                                        checked
+                                                            ? [...loaders, l]
+                                                            : loaders.filter((x) => x !== l),
+                                                    );
+                                                }}
+                                            />
+                                            {l}
+                                        </label>
+                                    ))}
+                                </div>
+                            </div>
+                        )}
+
+                        <div className="flex flex-wrap gap-4">
+                            <div>
+                                <div className="text-[0.65rem] uppercase tracking-wide opacity-60 mb-1">
+                                    Version
+                                </div>
+                                <Select
+                                    css={{ width: "160px" }}
+                                    value={gameVersion}
+                                    onChange={(e) => setGameVersion(e.currentTarget.value)}
+                                >
+                                    <option value="">Any version</option>
+                                    {gameVersion && !gameVersions.includes(gameVersion) && (
+                                        <option value={gameVersion}>{gameVersion}</option>
+                                    )}
+                                    {gameVersions.map((v) => (
+                                        <option key={v} value={v}>
+                                            {v}
+                                        </option>
+                                    ))}
+                                </Select>
+                            </div>
+
+                            <div className="flex-1 min-w-[200px]">
+                                <div className="text-[0.65rem] uppercase tracking-wide opacity-60 mb-1">
+                                    Search
+                                </div>
+                                <div className="flex gap-2">
+                                    <Input
+                                        css={{ flex: 1 }}
+                                        value={query}
+                                        onChange={(e) => setQuery(e.currentTarget.value)}
+                                        onKeyDown={(e) => e.key === "Enter" && search(query)}
+                                        placeholder={`Search ${TYPE_LABELS[type].toLowerCase()}...`}
+                                    />
+                                    <Button
+                                        onClick={() => search(query)}
+                                        disabled={searching}
+                                        aria-label="Search"
+                                    >
+                                        <SearchIcon css={{ width: "1.1rem", height: "1.1rem" }} />
+                                    </Button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
                     <div
                         css={{
-                            display: "flex",
-                            flexWrap: "wrap",
-                            gap: "0.25rem 0.75rem",
-                            maxWidth: "360px",
-                        }}
-                    >
-                        {LOADERS_BY_TYPE[type].map((l) => (
-                            <label
-                                key={l}
-                                css={{
-                                    display: "flex",
-                                    alignItems: "center",
-                                    gap: "0.35rem",
-                                    fontSize: "0.85rem",
-                                }}
-                            >
-                                <input
-                                    type="checkbox"
-                                    checked={loaders.includes(l)}
-                                    onChange={(e) => {
-                                        const checked = e.currentTarget.checked;
-                                        setLoaders((prev) =>
-                                            checked
-                                                ? [...prev, l]
-                                                : prev.filter((x) => x !== l),
-                                        );
-                                    }}
-                                />
-                                {l}
-                            </label>
-                        ))}
-                    </div>
-                </div>
-            )}
-
-            {!activeQuery.trim() && (
-                <div css={{ marginBottom: "1.5rem" }}>
-                    <button
-                        onClick={() => setInstalledCollapsed((v) => !v)}
-                        css={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "0.35rem",
                             fontSize: "0.85rem",
                             fontWeight: 600,
                             marginBottom: "0.5rem",
-                            background: "transparent",
-                            border: "none",
-                            padding: 0,
-                            cursor: "pointer",
-                            color: "inherit",
                         }}
                     >
-                        {installedCollapsed ? (
-                            <ChevronRightIcon
-                                css={{ width: "1rem", height: "1rem" }}
-                            />
-                        ) : (
-                            <ChevronDownIcon
-                                css={{ width: "1rem", height: "1rem" }}
-                            />
-                        )}
-                        Installed {TYPE_LABELS[type].toLowerCase()} (
-                        {installedFiles.length})
-                    </button>
-                    {!installedCollapsed &&
-                        (loadingInstalled ? (
-                            <Spinner size={Spinner.Size.SMALL} />
-                        ) : installedFiles.length === 0 ? (
-                            <div css={{ fontSize: "0.85rem", opacity: 0.6 }}>
-                                Nothing installed yet.
-                            </div>
-                        ) : (
-                            <div
-                                css={{
-                                    display: "flex",
-                                    flexDirection: "column",
-                                    gap: "0.5rem",
-                                }}
-                            >
-                                {installedFiles.map((f) => {
-                                    const hit = identified[f.name];
-                                    const deleteButton = (
-                                        <Button
-                                            color="red"
-                                            onClick={() =>
-                                                setConfirmUninstall(f)
-                                            }
-                                            disabled={uninstalling[f.name]}
-                                            isLoading={uninstalling[f.name]}
-                                        >
-                                            Uninstall
-                                        </Button>
-                                    );
-                                    const displayHit = hit ?? {
-                                        project_id: f.name,
-                                        slug: "",
-                                        title: f.name,
-                                        description:
-                                            hit === null
-                                                ? "Not found on this source."
-                                                : "Looking up details…",
-                                        project_type: type,
-                                        icon_url: null,
-                                        downloads: 0,
-                                    };
-
-                                    return (
-                                        <div
-                                            key={f.name}
-                                            ref={
-                                                hit === undefined
-                                                    ? getRowRefCallback(f.name)
-                                                    : undefined
-                                            }
-                                        >
-                                            <HitCard
-                                                hit={displayHit}
-                                                sizeLabel={formatSize(f.size)}
-                                                action={deleteButton}
-                                                provider={hit ? provider : undefined}
-                                            />
-                                        </div>
-                                    );
-                                })}
-                            </div>
-                        ))}
-                </div>
+                        Search
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+                        {results.map((hit) => {
+                            const installedFile = installedFileByProjectId(hit.project_id);
+                            const isInstalling = installing[hit.project_id];
+                            const isPendingConfirm =
+                                justInstalled[hit.project_id] && !installedFile;
+                            return (
+                                <BrowseCard
+                                    key={hit.project_id}
+                                    hit={hit}
+                                    provider={provider}
+                                    onDetails={() => openDetails(hit.project_id)}
+                                    action={
+                                        installedFile ? (
+                                            <Button
+                                                color="red"
+                                                isSecondary
+                                                onClick={() => setConfirmUninstall(installedFile)}
+                                                aria-label="Uninstall"
+                                                title="Uninstall"
+                                                className="!px-2"
+                                            >
+                                                <TrashIcon className="w-4 h-4" />
+                                            </Button>
+                                        ) : (
+                                            <Button
+                                                onClick={() => install(hit)}
+                                                disabled={isInstalling || isPendingConfirm}
+                                                isLoading={isInstalling || isPendingConfirm}
+                                                aria-label="Install"
+                                                title="Install"
+                                                className="!px-2"
+                                            >
+                                                <DownloadIcon className="w-4 h-4" />
+                                            </Button>
+                                        )
+                                    }
+                                />
+                            );
+                        })}
+                    </div>
+                    <Pagination
+                        page={page}
+                        totalHits={totalHits}
+                        onChange={goToPage}
+                        disabled={searching}
+                    />
+                </>
             )}
 
-            <div
-                css={{
-                    fontSize: "0.85rem",
-                    fontWeight: 600,
-                    marginBottom: "0.5rem",
-                }}
-            >
-                Search
-            </div>
-            <div
-                css={{
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: "0.75rem",
-                }}
-            >
-                {results.map((hit) => {
-                    const installedFile = installedFileByProjectId(
-                        hit.project_id,
-                    );
-                    const isInstalling = installing[hit.project_id];
-                    const isPendingConfirm =
-                        justInstalled[hit.project_id] && !installedFile;
-                    return (
-                        <HitCard
-                            key={hit.project_id}
-                            hit={hit}
-                            provider={provider}
-                            action={
-                                installedFile ? (
-                                    <Button
-                                        color="red"
-                                        onClick={() =>
-                                            setConfirmUninstall(installedFile)
-                                        }
-                                        disabled={
-                                            uninstalling[installedFile.name]
-                                        }
-                                        isLoading={
-                                            uninstalling[installedFile.name]
-                                        }
-                                    >
-                                        Uninstall
-                                    </Button>
-                                ) : (
-                                    <Button
-                                        onClick={() => install(hit)}
-                                        disabled={
-                                            isInstalling || isPendingConfirm
-                                        }
-                                        isLoading={
-                                            isInstalling || isPendingConfirm
-                                        }
-                                    >
-                                        Install
-                                    </Button>
-                                )
-                            }
-                        />
-                    );
-                })}
-            </div>
-
-            <Pagination
-                page={page}
-                totalHits={totalHits}
-                onChange={goToPage}
-                disabled={searching}
-            />
-
-            <Dialog
-                open={!!pendingHit}
-                onClose={() => setPendingHit(null)}
-                title={`Select a version${pendingHit ? ` — ${pendingHit.title}` : ""}`}
-            >
-                {loadingPendingVersions ? (
+            {activeTab === "manage" &&
+                (loadingInstalled ? (
                     <Spinner size={Spinner.Size.SMALL} centered />
-                ) : pendingVersions.length === 0 ? (
-                    <div css={{ fontSize: "0.85rem", opacity: 0.7 }}>
-                        No versions found for this project.
-                    </div>
+                ) : installedFiles.length === 0 ? (
+                    <div className="text-sm opacity-60">Nothing installed yet.</div>
                 ) : (
-                    <div
-                        css={{
-                            display: "flex",
-                            flexDirection: "column",
-                            gap: "0.5rem",
-                            maxHeight: "50vh",
-                            overflowY: "auto",
-                        }}
-                    >
-                        {showingAllVersions && (
-                            <div
-                                css={{
-                                    fontSize: "0.8rem",
-                                    opacity: 0.6,
-                                    marginBottom: "0.25rem",
-                                }}
-                            >
-                                No versions match your selected filters —
-                                showing all versions.
-                            </div>
-                        )}
-                        {(showingAllVersions
-                            ? pendingVersions
-                            : filteredPendingVersions
-                        ).map((v) => (
-                            <div
-                                key={v.id}
-                                css={{
-                                    display: "flex",
-                                    justifyContent: "space-between",
-                                    alignItems: "center",
-                                    padding: "0.5rem 0.75rem",
-                                    borderRadius: "0.25rem",
-                                    backgroundColor:
-                                        "rgba(255, 255, 255, 0.04)",
-                                }}
-                            >
-                                <div css={{ minWidth: 0 }}>
-                                    <div css={{ fontWeight: 600 }}>
-                                        {v.version_number}
-                                    </div>
-                                    <div
-                                        css={{
-                                            fontSize: "0.75rem",
-                                            opacity: 0.6,
-                                        }}
-                                    >
-                                        {v.loaders.join(", ")} &middot;{" "}
-                                        {v.game_versions.slice(-3).join(", ")}
-                                    </div>
+                    <div className="flex flex-col gap-2">
+                        {installedFiles.map((f) => {
+                            const hit = identified[f.name];
+                            const update = updateInfo[f.name];
+                            return (
+                                <div key={f.name}>
+                                    <ManageRow
+                                        hit={hit}
+                                        filename={f.name}
+                                        sizeLabel={type === "resourcepack" ? undefined : formatSize(f.size)}
+                                        hasUpdate={update?.has_update}
+                                        latestVersion={update?.latest_version}
+                                        provider={hit ? provider : undefined}
+                                        updating={updatingFile === f.name}
+                                        uninstalling={uninstalling[f.name]}
+                                        onUpdate={() => openUpdateDialog(f, hit)}
+                                        onUninstall={() => setConfirmUninstall(f)}
+                                    />
                                 </div>
-                                <Button
-                                    onClick={() =>
-                                        pendingHit &&
-                                        installVersion(pendingHit, v)
-                                    }
-                                    disabled={
-                                        pendingHit
-                                            ? installing[pendingHit.project_id]
-                                            : false
-                                    }
-                                >
-                                    Install
-                                </Button>
-                            </div>
-                        ))}
+                            );
+                        })}
                     </div>
-                )}
-            </Dialog>
+                ))}
+
+            <VersionDialog
+                open={!!pendingHit}
+                title={`Select a version${pendingHit ? ` — ${pendingHit.title}` : ""}`}
+                versions={showingAllVersions ? pendingVersions : filteredPendingVersions}
+                loading={loadingPendingVersions}
+                onPick={(v) => (updateTarget ? applyUpdate(v) : pendingHit && installVersion(pendingHit, v))}
+                onClose={() => {
+                    setPendingHit(null);
+                    setUpdateTarget(null);
+                }}
+                picking={isPicking ? "picking" : null}
+            />
 
             <Dialog
                 open={!!confirmUninstall}
                 onClose={() => setConfirmUninstall(null)}
                 title="Delete file?"
             >
-                Delete <strong>{confirmUninstall?.name}</strong>? This
-                can&apos;t be undone.
+                {type === "resourcepack" ? (
+                    <>
+                        Remove <strong>{confirmUninstall?.name}</strong> as the
+                        active resource pack? This clears it from
+                        server.properties.
+                    </>
+                ) : (
+                    <>
+                        Delete <strong>{confirmUninstall?.name}</strong>? This
+                        can&apos;t be undone.
+                    </>
+                )}
                 <Dialog.Footer>
                     <Button
                         isSecondary
@@ -1101,6 +972,17 @@ export default () => {
                     </Button>
                 </Dialog.Footer>
             </Dialog>
+
+            <DetailsDialog
+                open={!!detailsProjectId}
+                details={details}
+                loading={loadingDetails}
+                provider={provider}
+                onClose={() => {
+                    setDetailsProjectId(null);
+                    setDetails(null);
+                }}
+            />
         </div>
     );
 };

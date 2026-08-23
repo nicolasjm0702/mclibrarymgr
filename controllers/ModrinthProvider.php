@@ -8,8 +8,7 @@ use Illuminate\Support\Facades\Cache;
 class ModrinthProvider implements LibraryProvider
 {
     use ClientOnlyOverrides;
-
-    private const CACHE_TTL = 60 * 60 * 12; // 12 hours
+    use CachedRequests;
 
     private Client $http;
 
@@ -21,9 +20,11 @@ class ModrinthProvider implements LibraryProvider
     public function search(array $params): array
     {
         if ($projectId = $params['project_id'] ?? null) {
-            $response = $this->http->get("project/{$projectId}/version");
+            return $this->cached("mclibrarymgr:modrinth:versions:{$projectId}", function () use ($projectId) {
+                $response = $this->http->get("project/{$projectId}/version");
 
-            return ['versions' => json_decode($response->getBody()->getContents(), true)];
+                return ['versions' => json_decode($response->getBody()->getContents(), true)];
+            });
         }
 
         $facets = [["project_type:" . ($params['type'] ?? 'mod')]];
@@ -37,25 +38,45 @@ class ModrinthProvider implements LibraryProvider
             $facets[] = ["versions:{$version}"];
         }
 
-        $response = $this->http->get('search', [
-            'query' => [
-                'query' => $params['q'] ?? '',
-                'facets' => json_encode($facets),
-                'offset' => $params['offset'] ?? 0,
-                'limit' => $params['limit'] ?? 15,
-            ],
-        ]);
+        $query = [
+            'query' => $params['q'] ?? '',
+            'facets' => json_encode($facets),
+            'offset' => $params['offset'] ?? 0,
+            'limit' => $params['limit'] ?? 15,
+        ];
 
-        $data = json_decode($response->getBody()->getContents(), true);
+        return $this->cached('mclibrarymgr:modrinth:search:' . md5(json_encode($query)), function () use ($query, $params) {
+            $response = $this->http->get('search', ['query' => $query]);
+            $data = json_decode($response->getBody()->getContents(), true);
 
-        if (($params['type'] ?? 'mod') === 'mod') {
-            $data['hits'] = array_values(array_filter(
-                $data['hits'] ?? [],
-                fn ($hit) => ($hit['server_side'] ?? 'required') !== 'unsupported'
-            ));
-        }
+            if (($params['type'] ?? 'mod') === 'mod') {
+                $data['hits'] = array_values(array_filter(
+                    $data['hits'] ?? [],
+                    fn ($hit) => ($hit['server_side'] ?? 'required') !== 'unsupported'
+                ));
+            }
 
-        return $data;
+            $loaderList = ['fabric', 'forge', 'neoforge', 'quilt', 'paper', 'spigot', 'purpur', 'bukkit', 'folia', 'velocity', 'waterfall', 'bungeecord'];
+            $type = $params['type'] ?? 'mod';
+
+            $data['hits'] = array_map(function ($hit) use ($loaderList, $type, $params) {
+                $hit['likes'] = $hit['follows'] ?? 0;
+
+                if (in_array($type, ['mod', 'plugin'], true)) {
+                    $hit['loaders'] = array_values(array_intersect($hit['categories'] ?? [], $loaderList));
+                } else {
+                    $versions = $hit['versions'] ?? [];
+                    $matching = $params['version'] ?? null
+                        ? array_values(array_filter($versions, fn ($v) => $v === $params['version']))
+                        : $versions;
+                    $hit['latest_version'] = end($matching) ?: (end($versions) ?: null);
+                }
+
+                return $hit;
+            }, $data['hits'] ?? []);
+
+            return $data;
+        });
     }
 
     public function projectVersions(string $projectId, array $filters): array
@@ -69,9 +90,14 @@ class ModrinthProvider implements LibraryProvider
             $query['game_versions'] = json_encode([$version]);
         }
 
-        $response = $this->http->get("project/{$projectId}/version", ['query' => $query]);
+        return $this->cached(
+            "mclibrarymgr:modrinth:projectversions:{$projectId}:" . md5(json_encode($query)),
+            function () use ($projectId, $query) {
+                $response = $this->http->get("project/{$projectId}/version", ['query' => $query]);
 
-        return json_decode($response->getBody()->getContents(), true);
+                return json_decode($response->getBody()->getContents(), true);
+            }
+        );
     }
 
     public function resolveInstallFile(array $installParams): array
@@ -106,39 +132,51 @@ class ModrinthProvider implements LibraryProvider
             return $result;
         }
 
-        try {
-            $versionsByHash = json_decode($this->http->post('version_files', [
-                'json' => ['hashes' => array_values($hashesByKey), 'algorithm' => 'sha1'],
-            ])->getBody()->getContents(), true);
+        $uniqueHashes = array_values(array_unique($hashesByKey));
+        sort($uniqueHashes);
+        $cacheKey = 'mclibrarymgr:modrinth:identify:' . md5(json_encode($uniqueHashes));
 
-            $projectIds = array_values(array_unique(array_column($versionsByHash, 'project_id')));
-            if (!$projectIds) {
+        $byHash = Cache::get($cacheKey);
+        if ($byHash === null) {
+            try {
+                $versionsByHash = json_decode($this->http->post('version_files', [
+                    'json' => ['hashes' => $uniqueHashes, 'algorithm' => 'sha1'],
+                ])->getBody()->getContents(), true);
+
+                $projectIds = array_values(array_unique(array_column($versionsByHash, 'project_id')));
+                $projectsById = $projectIds ? array_column(
+                    json_decode($this->http->get('projects', [
+                        'query' => ['ids' => json_encode($projectIds)],
+                    ])->getBody()->getContents(), true),
+                    null,
+                    'id'
+                ) : [];
+            } catch (\Exception $exception) {
+                // API hiccup — don't cache a failure, just report nothing found this request.
                 return $result;
             }
 
-            $projectsById = array_column(
-                json_decode($this->http->get('projects', [
-                    'query' => ['ids' => json_encode($projectIds)],
-                ])->getBody()->getContents(), true),
-                null,
-                'id'
-            );
-        } catch (\Exception $exception) {
-            return $result;
+            $byHash = [];
+            foreach ($uniqueHashes as $hash) {
+                $project = $projectsById[$versionsByHash[$hash]['project_id'] ?? null] ?? null;
+                if ($project) {
+                    $byHash[$hash] = [
+                        'project_id' => $project['id'],
+                        'slug' => $project['slug'],
+                        'title' => $project['title'],
+                        'description' => $project['description'],
+                        'icon_url' => $project['icon_url'],
+                        'downloads' => $project['downloads'],
+                        'likes' => $project['followers'] ?? 0,
+                    ];
+                }
+            }
+
+            Cache::put($cacheKey, $byHash, self::CACHE_TTL);
         }
 
         foreach ($hashesByKey as $key => $hash) {
-            $project = $projectsById[$versionsByHash[$hash]['project_id'] ?? null] ?? null;
-            if ($project) {
-                $result[$key] = [
-                    'project_id' => $project['id'],
-                    'slug' => $project['slug'],
-                    'title' => $project['title'],
-                    'description' => $project['description'],
-                    'icon_url' => $project['icon_url'],
-                    'downloads' => $project['downloads'],
-                ];
-            }
+            $result[$key] = $byHash[$hash] ?? null;
         }
 
         return $result;
@@ -156,36 +194,41 @@ class ModrinthProvider implements LibraryProvider
             $facets[] = ["categories:{$loader}"];
         }
 
-        $response = $this->http->get('search', [
-            'query' => [
-                'query' => $params['q'] ?? '',
-                'facets' => json_encode($facets),
-                'offset' => $params['offset'] ?? 0,
-                'limit' => $params['limit'] ?? 15,
-            ],
-        ]);
+        $query = [
+            'query' => $params['q'] ?? '',
+            'facets' => json_encode($facets),
+            'offset' => $params['offset'] ?? 0,
+            'limit' => $params['limit'] ?? 15,
+        ];
 
-        $data = json_decode($response->getBody()->getContents(), true);
-        $data['hits'] = array_map(function ($hit) {
-            $hit['loaders'] = array_values(array_intersect(
-                $hit['categories'] ?? [],
-                ['fabric', 'forge', 'neoforge', 'quilt']
-            ));
+        return $this->cached('mclibrarymgr:modrinth:searchmodpacks:' . md5(json_encode($query)), function () use ($query) {
+            $response = $this->http->get('search', ['query' => $query]);
 
-            return $hit;
-        }, $data['hits'] ?? []);
+            $data = json_decode($response->getBody()->getContents(), true);
+            $data['hits'] = array_map(function ($hit) {
+                $hit['loaders'] = array_values(array_intersect(
+                    $hit['categories'] ?? [],
+                    ['fabric', 'forge', 'neoforge', 'quilt']
+                ));
+                $hit['likes'] = $hit['follows'] ?? 0;
 
-        return $data;
+                return $hit;
+            }, $data['hits'] ?? []);
+
+            return $data;
+        });
     }
 
     public function projectInfo(string $projectId): ?array
     {
-        return Cache::remember("mclibrarymgr:modrinth:projectinfo:{$projectId}", self::CACHE_TTL, function () use ($projectId) {
+        return $this->cached("mclibrarymgr:modrinth:projectinfo:{$projectId}", function () use ($projectId) {
             try {
                 $project = json_decode(
                     $this->http->get("project/{$projectId}")->getBody()->getContents(),
                     true
                 );
+
+                $loaderList = ['fabric', 'forge', 'neoforge', 'quilt', 'paper', 'spigot', 'purpur', 'bukkit', 'folia', 'velocity', 'waterfall', 'bungeecord'];
 
                 return [
                     'project_id' => $project['id'],
@@ -195,6 +238,13 @@ class ModrinthProvider implements LibraryProvider
                     'project_type' => $project['project_type'],
                     'icon_url' => $project['icon_url'],
                     'downloads' => $project['downloads'],
+                    'likes' => $project['followers'] ?? 0,
+                    'categories' => array_values(array_diff($project['categories'] ?? [], $loaderList)),
+                    'loaders' => array_values(array_intersect($project['categories'] ?? [], $loaderList)),
+                    'game_versions' => array_slice($project['game_versions'] ?? [], -10),
+                    'body' => $project['body'] ?? '',
+                    'updated' => $project['updated'] ?? null,
+                    'published' => $project['published'] ?? null,
                 ];
             } catch (\Exception $exception) {
                 return null;

@@ -6,30 +6,17 @@ import Input from "@/components/elements/Input";
 import Spinner from "@/components/elements/Spinner";
 import { Dialog } from "@/components/elements/dialog";
 import FlashMessageRender from "@/components/FlashMessageRender";
-import { SearchIcon, TrashIcon } from "@heroicons/react/solid";
+import { SearchIcon, TrashIcon, ClockIcon } from "@heroicons/react/solid";
 import useFlash from "@/plugins/useFlash";
 import http from "@/api/http";
-import SourceSelector, { Source, sourceProjectUrl } from "./SourceSelector";
+import { Source } from "./SourceSelector";
 import Pagination from "./Pagination";
-
-interface ModpackHit {
-    project_id: string;
-    slug: string;
-    title: string;
-    description: string;
-    project_type: string;
-    icon_url: string | null;
-    author?: string;
-    downloads: number;
-    loaders?: string[];
-}
-
-interface ModpackVersion {
-    id: string;
-    version_number: string;
-    game_versions: string[];
-    loaders: string[];
-}
+import { Hit, Version, ProjectDetails } from "./library/types";
+import { timeAgo } from "./library/format";
+import useServerFilters from "./library/useServerFilters";
+import BrowseCard from "./library/BrowseCard";
+import VersionDialog from "./library/VersionDialog";
+import DetailsDialog from "./library/DetailsDialog";
 
 interface ManifestEntry {
     path: string;
@@ -50,6 +37,8 @@ interface InstalledModpack {
     project_type?: string;
     icon_url?: string | null;
     downloads?: number;
+    likes?: number;
+    installed_at?: string;
 }
 
 const LOADERS = ["fabric", "forge", "neoforge", "quilt"];
@@ -103,112 +92,14 @@ const detectFromInstalledFiles = async (uuid: string) => {
     return { loader: null, version: null };
 };
 
-const formatDownloads = (n: number) => {
-    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
-    return `${n}`;
-};
-
-const HitCard = ({
-    hit,
-    action,
-    provider,
-}: {
-    hit: ModpackHit;
-    action: React.ReactNode;
-    provider: string;
-}) => (
-    <div
-        css={{
-            display: "flex",
-            alignItems: "center",
-            gap: "1rem",
-            padding: "1rem",
-            borderRadius: "0.5rem",
-            backgroundColor: "rgba(255, 255, 255, 0.04)",
-        }}
-    >
-        {hit.icon_url ? (
-            <img
-                src={hit.icon_url}
-                alt={hit.title}
-                css={{
-                    width: "56px",
-                    height: "56px",
-                    borderRadius: "0.375rem",
-                    flexShrink: 0,
-                }}
-            />
-        ) : (
-            <div
-                css={{
-                    width: "56px",
-                    height: "56px",
-                    borderRadius: "0.375rem",
-                    flexShrink: 0,
-                    backgroundColor: "rgba(255, 255, 255, 0.08)",
-                }}
-            />
-        )}
-
-        <div css={{ flex: 1, minWidth: 0 }}>
-            <div css={{ fontWeight: 600 }}>
-                <a
-                    href={sourceProjectUrl(provider, hit)}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    css={{
-                        color: "inherit",
-                        "&:hover": { textDecoration: "underline" },
-                    }}
-                >
-                    {hit.title}
-                </a>
-            </div>
-            <div
-                css={{
-                    fontSize: "0.85rem",
-                    opacity: 0.7,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                }}
-            >
-                {hit.description}
-            </div>
-            <div
-                css={{
-                    fontSize: "0.75rem",
-                    opacity: 0.5,
-                    marginTop: "0.25rem",
-                }}
-            >
-                {hit.author && <>by {hit.author} &middot; </>}
-                {formatDownloads(hit.downloads)} downloads
-                {hit.loaders && hit.loaders.length > 0 && (
-                    <> &middot; {hit.loaders.join(", ")}</>
-                )}
-            </div>
-        </div>
-
-        <div
-            css={{
-                display: "flex",
-                alignItems: "center",
-                gap: "0.5rem",
-                flexShrink: 0,
-            }}
-        >
-            {action}
-        </div>
-    </div>
-);
-
 export default () => {
     const uuid = ServerContext.useStoreState(
         (state) => state.server.data!.uuid,
     );
     const { addFlash, clearFlashes } = useFlash();
+
+    const { loaders, version: gameVersion, setLoaders, setVersion: setGameVersion, hasStored } = useServerFilters(uuid);
+    const loader = loaders[0] ?? "";
 
     const [provider, setProvider] = useState("modrinth");
     const [sources, setSources] = useState<Source[]>([]);
@@ -217,23 +108,23 @@ export default () => {
     const [installedModpack, setInstalledModpack] =
         useState<InstalledModpack | null>(null);
     const [query, setQuery] = useState("");
-    const [loader, setLoader] = useState("");
-    const [gameVersion, setGameVersion] = useState("");
     const [gameVersions, setGameVersions] = useState<string[]>([]);
     const [searching, setSearching] = useState(false);
-    const [results, setResults] = useState<ModpackHit[]>([]);
+    const [results, setResults] = useState<Hit[]>([]);
     const [totalHits, setTotalHits] = useState(0);
     const [page, setPage] = useState(1);
 
-    const [pendingHit, setPendingHit] = useState<ModpackHit | null>(null);
-    const [pendingVersions, setPendingVersions] = useState<ModpackVersion[]>(
-        [],
-    );
+    const [detailsProjectId, setDetailsProjectId] = useState<string | null>(null);
+    const [details, setDetails] = useState<ProjectDetails | null>(null);
+    const [loadingDetails, setLoadingDetails] = useState(false);
+
+    const [pendingHit, setPendingHit] = useState<Hit | null>(null);
+    const [pendingVersions, setPendingVersions] = useState<Version[]>([]);
     const [loadingPendingVersions, setLoadingPendingVersions] = useState(false);
 
     const [confirmInstall, setConfirmInstall] = useState<{
-        hit: ModpackHit;
-        version: ModpackVersion;
+        hit: Hit;
+        version: Version;
     } | null>(null);
 
     const [installToken, setInstallToken] = useState<string | null>(null);
@@ -241,6 +132,7 @@ export default () => {
     const [installVersionNumber, setInstallVersionNumber] = useState("");
     const [entryRows, setEntryRows] = useState<EntryRow[]>([]);
     const [installRunning, setInstallRunning] = useState(false);
+    const [installBusy, setInstallBusy] = useState(false);
     const [installDone, setInstallDone] = useState(false);
     const [installIndex, setInstallIndex] = useState(-1);
     const [installTotal, setInstallTotal] = useState(0);
@@ -313,6 +205,8 @@ export default () => {
             const validVersions: string[] = data.versions ?? [];
             setGameVersions(validVersions);
 
+            if (hasStored()) return;
+
             detectFromInstalledFiles(uuid).then((detected) => {
                 if (!detected.loader && !detected.version) return;
 
@@ -321,14 +215,14 @@ export default () => {
                         ? detected.version
                         : null;
 
-                if (detected.loader) setLoader(detected.loader);
+                if (detected.loader) setLoaders([detected.loader]);
                 if (realVersion) setGameVersion(realVersion);
                 search("", detected.loader ?? "", realVersion ?? "");
             });
         });
 
         refreshInstalled();
-        search("", "", "");
+        search("", loader, gameVersion);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [uuid]);
 
@@ -389,7 +283,7 @@ export default () => {
             );
     };
 
-    const openVersionPicker = (hit: ModpackHit) => {
+    const openVersionPicker = (hit: Hit) => {
         setPendingHit(hit);
         setLoadingPendingVersions(true);
         clearFlashes("modpack");
@@ -410,7 +304,24 @@ export default () => {
             .finally(() => setLoadingPendingVersions(false));
     };
 
-    const matchesCurrentFilters = (v: ModpackVersion) =>
+    const openDetails = (projectId: string) => {
+        setDetailsProjectId(projectId);
+        setLoadingDetails(true);
+        http.get(`/api/client/extensions/mclibrarymgr/servers/${uuid}/details`, {
+            params: { project_id: projectId },
+        })
+            .then(({ data }) => setDetails(data))
+            .catch((error) =>
+                addFlash({
+                    key: "modpack",
+                    type: "error",
+                    message: error?.response?.data?.message || error.message,
+                }),
+            )
+            .finally(() => setLoadingDetails(false));
+    };
+
+    const matchesCurrentFilters = (v: Version) =>
         (!gameVersion || v.game_versions.includes(gameVersion)) &&
         (!loader || v.loaders.map((l) => l.toLowerCase()).includes(loader));
 
@@ -420,9 +331,9 @@ export default () => {
     const showingAllVersions =
         pendingVersions.length > 0 && filteredPendingVersions.length === 0;
 
-    const pickVersion = (version: ModpackVersion) => {
+    const pickVersion = (v: Version) => {
         if (!pendingHit) return;
-        setConfirmInstall({ hit: pendingHit, version });
+        setConfirmInstall({ hit: pendingHit, version: v });
         setPendingHit(null);
     };
 
@@ -431,6 +342,7 @@ export default () => {
         const { hit, version } = confirmInstall;
         setConfirmInstall(null);
         clearFlashes("modpack");
+        setInstallBusy(true);
 
         http.post(
             `/api/client/extensions/mclibrarymgr/servers/${uuid}/modpacks/manifest`,
@@ -496,6 +408,7 @@ export default () => {
                 );
 
                 setInstallDone(true);
+                setInstallBusy(false);
                 addFlash({
                     key: "modpack",
                     type:
@@ -507,13 +420,14 @@ export default () => {
 
                 setTimeout(() => window.location.reload(), 1500);
             })
-            .catch((error) =>
+            .catch((error) => {
+                setInstallBusy(false);
                 addFlash({
                     key: "modpack",
                     type: "error",
                     message: error?.response?.data?.message || error.message,
-                }),
-            );
+                });
+            });
     };
 
     if (!enabled) {
@@ -533,221 +447,177 @@ export default () => {
                 css={{ marginBottom: "1rem" }}
             />
 
-            <SourceSelector
-                provider={provider}
-                sources={sources}
-                onChange={changeProvider}
-            />
+            <div className="mb-4">
+                <div className="text-[0.65rem] uppercase tracking-wide opacity-60 mb-1">
+                    Platform
+                </div>
+                <Select
+                    css={{ width: "160px" }}
+                    value={provider}
+                    onChange={(e) => changeProvider(e.currentTarget.value)}
+                >
+                    {sources.map(({ id, label, available }) => (
+                        <option key={id} value={id} disabled={!available}>
+                            {label}
+                            {available ? "" : " (not configured)"}
+                        </option>
+                    ))}
+                </Select>
+            </div>
 
-            {installedModpack && (
+            {installedModpack && !installedModpack.project_id && (
+                <div className="text-sm opacity-60 mb-6">
+                    No modpack installed. You can install one from the search
+                    results below.
+                </div>
+            )}
+
+            {installedModpack?.project_id && (
                 <>
-                    <div
-                        css={{
-                            fontSize: "0.85rem",
-                            fontWeight: 600,
-                            marginBottom: "0.5rem",
-                        }}
-                    >
-                        Installed
-                    </div>
-                    <div css={{ marginBottom: "1.5rem" }}>
-                        {!installedModpack.project_id ? (
-                            <span>
-                                No modpack installed. You can install one from
-                                the search results below.
-                            </span>
-                        ) : (
-                            <HitCard
-                                hit={{
-                                    project_id: installedModpack.project_id,
-                                    slug: installedModpack.slug ?? "",
-                                    title:
-                                        installedModpack.title ??
-                                        installedModpack.name,
-                                    description:
-                                        installedModpack.description ?? "",
-                                    project_type:
-                                        installedModpack.project_type ??
-                                        "modpack",
-                                    icon_url: installedModpack.icon_url ?? null,
-                                    downloads: installedModpack.downloads ?? 0,
-                                }}
-                                provider={provider}
-                                action={
-                                    <div
-                                        css={{
-                                            display: "flex",
-                                            flexDirection: "column",
-                                            alignItems: "flex-end",
-                                            gap: "0.35rem",
-                                        }}
+                    <div className="text-xs uppercase tracking-wide opacity-60 mb-2">Most recently installed modpack</div>
+                    <div className="mb-6">
+                        <BrowseCard
+                            hit={{
+                                project_id: installedModpack.project_id,
+                                slug: installedModpack.slug ?? "",
+                                title: installedModpack.title ?? installedModpack.name,
+                                description: installedModpack.description ?? "",
+                                project_type: installedModpack.project_type ?? "modpack",
+                                icon_url: installedModpack.icon_url ?? null,
+                                downloads: installedModpack.downloads ?? 0,
+                                likes: installedModpack.likes ?? 0,
+                            }}
+                            provider={provider}
+                            showSourceLink
+                            providerBadge={sources.find((s) => s.id === provider)?.label ?? provider}
+                            onDetails={() => openDetails(installedModpack.project_id as string)}
+                            metaRow={
+                                <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs opacity-70">
+                                    <span>
+                                        {installedModpack.title ?? installedModpack.name} {installedModpack.version_number}
+                                    </span>
+                                    {installedModpack.installed_at && (
+                                        <span className="flex items-center gap-1">
+                                            <ClockIcon className="w-3.5 h-3.5" /> Installed {timeAgo(installedModpack.installed_at)}
+                                        </span>
+                                    )}
+                                    {loaders[0] && <span>Loader: {loaders[0].toUpperCase()}</span>}
+                                    {gameVersion && <span>Version: {gameVersion}</span>}
+                                </div>
+                            }
+                            action={
+                                <div className="flex items-center gap-2">
+                                    <Button
+                                        isSecondary
+                                        onClick={() =>
+                                            openVersionPicker({
+                                                project_id: installedModpack.project_id as string,
+                                                slug: installedModpack.slug ?? "",
+                                                title: installedModpack.title ?? installedModpack.name,
+                                                description: installedModpack.description ?? "",
+                                                project_type: installedModpack.project_type ?? "modpack",
+                                                icon_url: installedModpack.icon_url ?? null,
+                                                downloads: installedModpack.downloads ?? 0,
+                                                likes: installedModpack.likes ?? 0,
+                                            })
+                                        }
                                     >
-                                        <div
-                                            css={{
-                                                fontSize: "0.75rem",
-                                                opacity: 0.7,
-                                            }}
-                                        >
-                                            v{installedModpack.version_number}
-                                        </div>
-                                        <div
-                                            css={{
-                                                display: "flex",
-                                                gap: "0.5rem",
-                                            }}
-                                        >
-                                            <Button
-                                                isSecondary
-                                                onClick={() =>
-                                                    openVersionPicker({
-                                                        project_id:
-                                                            installedModpack.project_id as string,
-                                                        slug:
-                                                            installedModpack.slug ??
-                                                            "",
-                                                        title:
-                                                            installedModpack.title ??
-                                                            installedModpack.name,
-                                                        description:
-                                                            installedModpack.description ??
-                                                            "",
-                                                        project_type:
-                                                            installedModpack.project_type ??
-                                                            "modpack",
-                                                        icon_url:
-                                                            installedModpack.icon_url ??
-                                                            null,
-                                                        downloads:
-                                                            installedModpack.downloads ??
-                                                            0,
-                                                    })
-                                                }
-                                            >
-                                                Change version
-                                            </Button>
-                                            <Button
-                                                color="red"
-                                                onClick={() =>
-                                                    setConfirmUninstallModpack(
-                                                        true,
-                                                    )
-                                                }
-                                                aria-label="Uninstall modpack"
-                                            >
-                                                <TrashIcon
-                                                    css={{
-                                                        width: "1rem",
-                                                        height: "1rem",
-                                                    }}
-                                                />
-                                            </Button>
-                                        </div>
-                                    </div>
-                                }
-                            />
-                        )}
+                                        Change version
+                                    </Button>
+                                    <Button color="red" onClick={() => setConfirmUninstallModpack(true)} aria-label="Uninstall modpack" className="!px-2">
+                                        <TrashIcon className="w-4 h-4" />
+                                    </Button>
+                                </div>
+                            }
+                        />
                     </div>
                 </>
             )}
 
-            <div
-                css={{
-                    display: "flex",
-                    gap: "0.25rem",
-                    marginBottom: "0.75rem",
-                    flexWrap: "wrap",
-                }}
-            >
-                <Select
-                    css={{ width: "160px", flexShrink: 0 }}
-                    value={gameVersion}
-                    onChange={(e) => {
-                        const next = e.currentTarget.value;
-                        setGameVersion(next);
-                        search(query, loader, next);
-                    }}
-                >
-                    <option value="">Any version</option>
-                    {gameVersion && !gameVersions.includes(gameVersion) && (
-                        <option value={gameVersion}>{gameVersion}</option>
-                    )}
-                    {gameVersions.map((v) => (
-                        <option key={v} value={v}>
-                            {v}
-                        </option>
-                    ))}
-                </Select>
-                <Input
-                    css={{ flex: 1 }}
-                    value={query}
-                    onChange={(e) => setQuery(e.currentTarget.value)}
-                    onKeyDown={(e) =>
-                        e.key === "Enter" && search(query, loader, gameVersion)
-                    }
-                    placeholder="Search modpacks..."
-                />
-                <Button
-                    onClick={() => search(query, loader, gameVersion)}
-                    disabled={searching}
-                    aria-label="Search"
-                >
-                    <SearchIcon css={{ width: "1.1rem", height: "1.1rem" }} />
-                </Button>
-            </div>
+            <div className="flex flex-col gap-3 bg-white/[0.04] rounded-lg p-3 mb-4">
+                <div>
+                    <div className="text-[0.65rem] uppercase tracking-wide opacity-60 mb-1">
+                        Loader
+                    </div>
+                    <div className="flex flex-wrap gap-x-3 gap-y-1">
+                        {LOADERS.map((l) => (
+                            <label key={l} className="flex items-center gap-1.5 text-sm">
+                                <input
+                                    type="checkbox"
+                                    checked={loader === l}
+                                    onChange={(e) => {
+                                        const next = e.currentTarget.checked ? l : "";
+                                        setLoaders(next ? [next] : []);
+                                        search(query, next, gameVersion);
+                                    }}
+                                />
+                                {l}
+                            </label>
+                        ))}
+                    </div>
+                </div>
 
-            <div
-                css={{
-                    display: "flex",
-                    flexWrap: "wrap",
-                    gap: "0.25rem 0.75rem",
-                    marginBottom: "1.5rem",
-                }}
-            >
-                {LOADERS.map((l) => (
-                    <label
-                        key={l}
-                        css={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: "0.35rem",
-                            fontSize: "0.85rem",
-                        }}
-                    >
-                        <input
-                            type="checkbox"
-                            checked={loader === l}
+                <div className="flex flex-wrap gap-4">
+                    <div>
+                        <div className="text-[0.65rem] uppercase tracking-wide opacity-60 mb-1">
+                            Version
+                        </div>
+                        <Select
+                            css={{ width: "160px" }}
+                            value={gameVersion}
                             onChange={(e) => {
-                                const next = e.currentTarget.checked ? l : "";
-                                setLoader(next);
-                                search(query, next, gameVersion);
+                                const next = e.currentTarget.value;
+                                setGameVersion(next);
+                                search(query, loader, next);
                             }}
-                        />
-                        {l}
-                    </label>
-                ))}
+                        >
+                            <option value="">Any version</option>
+                            {gameVersion && !gameVersions.includes(gameVersion) && (
+                                <option value={gameVersion}>{gameVersion}</option>
+                            )}
+                            {gameVersions.map((v) => (
+                                <option key={v} value={v}>
+                                    {v}
+                                </option>
+                            ))}
+                        </Select>
+                    </div>
+
+                    <div className="flex-1 min-w-[200px]">
+                        <div className="text-[0.65rem] uppercase tracking-wide opacity-60 mb-1">
+                            Search
+                        </div>
+                        <div className="flex gap-2">
+                            <Input
+                                css={{ flex: 1 }}
+                                value={query}
+                                onChange={(e) => setQuery(e.currentTarget.value)}
+                                onKeyDown={(e) =>
+                                    e.key === "Enter" && search(query, loader, gameVersion)
+                                }
+                                placeholder="Search modpacks..."
+                            />
+                            <Button
+                                onClick={() => search(query, loader, gameVersion)}
+                                disabled={searching}
+                                aria-label="Search"
+                            >
+                                <SearchIcon css={{ width: "1.1rem", height: "1.1rem" }} />
+                            </Button>
+                        </div>
+                    </div>
+                </div>
             </div>
 
-            <div
-                css={{
-                    fontSize: "0.85rem",
-                    fontWeight: 600,
-                    marginBottom: "0.5rem",
-                }}
-            >
-                Search
-            </div>
-            <div
-                css={{
-                    display: "flex",
-                    flexDirection: "column",
-                    gap: "0.75rem",
-                }}
-            >
+            <div className="text-sm font-semibold mb-2">Search</div>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
                 {results.map((hit) => (
-                    <HitCard
+                    <BrowseCard
                         key={hit.project_id}
                         hit={hit}
                         provider={provider}
+                        showSourceLink
+                        onDetails={() => openDetails(hit.project_id)}
                         action={
                             <Button onClick={() => openVersionPicker(hit)}>
                                 Install
@@ -764,69 +634,16 @@ export default () => {
                 disabled={searching}
             />
 
-            <Dialog
+            <VersionDialog
                 open={!!pendingHit}
-                onClose={() => setPendingHit(null)}
                 title={`Select a version${pendingHit ? ` — ${pendingHit.title}` : ""}`}
-            >
-                {loadingPendingVersions ? (
-                    <Spinner size={Spinner.Size.SMALL} centered />
-                ) : pendingVersions.length === 0 ? (
-                    <div css={{ fontSize: "0.85rem", opacity: 0.7 }}>
-                        No versions found for this project.
-                    </div>
-                ) : (
-                    <div
-                        css={{
-                            display: "flex",
-                            flexDirection: "column",
-                            gap: "0.5rem",
-                            maxHeight: "50vh",
-                            overflowY: "auto",
-                        }}
-                    >
-                        {showingAllVersions && (
-                            <div
-                                css={{
-                                    fontSize: "0.8rem",
-                                    opacity: 0.6,
-                                    marginBottom: "0.25rem",
-                                }}
-                            >
-                                No versions match your selected filters —
-                                showing all versions.
-                            </div>
-                        )}
-                        {(showingAllVersions
-                            ? pendingVersions
-                            : filteredPendingVersions
-                        ).map((v) => (
-                            <div
-                                key={v.id}
-                                css={{
-                                    display: "flex",
-                                    justifyContent: "space-between",
-                                    alignItems: "center",
-                                    padding: "0.5rem 0.75rem",
-                                    borderRadius: "0.25rem",
-                                    backgroundColor:
-                                        "rgba(255, 255, 255, 0.04)",
-                                }}
-                            >
-                                <div css={{ fontWeight: 600 }}>
-                                    {v.version_number}
-                                </div>
-                                <Button onClick={() => pickVersion(v)}>
-                                    {installedModpack?.version_number ===
-                                    v.version_number
-                                        ? "Reinstall"
-                                        : "Select"}
-                                </Button>
-                            </div>
-                        ))}
-                    </div>
-                )}
-            </Dialog>
+                versions={showingAllVersions ? pendingVersions : filteredPendingVersions}
+                loading={loadingPendingVersions}
+                installedVersionNumber={installedModpack?.version_number}
+                onPick={pickVersion}
+                onClose={() => setPendingHit(null)}
+                picking={installBusy ? "installing" : null}
+            />
 
             <Dialog
                 open={!!confirmInstall}
@@ -947,6 +764,17 @@ export default () => {
                     </Dialog.Footer>
                 )}
             </Dialog>
+
+            <DetailsDialog
+                open={!!detailsProjectId}
+                details={details}
+                loading={loadingDetails}
+                provider={provider}
+                onClose={() => {
+                    setDetailsProjectId(null);
+                    setDetails(null);
+                }}
+            />
         </div>
     );
 };

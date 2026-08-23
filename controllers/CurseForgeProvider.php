@@ -8,8 +8,7 @@ use Illuminate\Support\Facades\Cache;
 class CurseForgeProvider implements LibraryProvider
 {
     use ClientOnlyOverrides;
-
-    private const CACHE_TTL = 60 * 60 * 12; // 12 hours
+    use CachedRequests;
 
     private const GAME_ID = 432; // Minecraft
 
@@ -59,23 +58,47 @@ class CurseForgeProvider implements LibraryProvider
             $query['gameVersion'] = $version;
         }
 
-        $response = $this->http->get('mods/search', ['query' => $query]);
-        $data = json_decode($response->getBody()->getContents(), true);
+        return $this->cached('mclibrarymgr:curseforge:search:' . md5(json_encode($query)), function () use ($query, $params) {
+            $response = $this->http->get('mods/search', ['query' => $query]);
+            $data = json_decode($response->getBody()->getContents(), true);
 
-        $hits = array_map(fn ($mod) => [
-            'project_id' => (string) $mod['id'],
-            'slug' => $mod['slug'],
-            'title' => $mod['name'],
-            'description' => $mod['summary'],
-            'project_type' => $params['type'] ?? 'mod',
-            'icon_url' => $mod['logo']['url'] ?? null,
-            'author' => $mod['authors'][0]['name'] ?? null,
-            'downloads' => $mod['downloadCount'],
-        ], $data['data']);
+            $loaderTypes = array_keys(self::MOD_LOADER_TYPES);
+            $type = $params['type'] ?? 'mod';
 
-        // CurseForge has no per-project client/server-only field in its
-        // public API — no equivalent filter here (known gap, see ModrinthProvider).
-        return ['hits' => $hits, 'total_hits' => $data['pagination']['totalCount'] ?? count($hits)];
+            $hits = array_map(function ($mod) use ($params, $type, $loaderTypes) {
+                $hit = [
+                    'project_id' => (string) $mod['id'],
+                    'slug' => $mod['slug'],
+                    'title' => $mod['name'],
+                    'description' => $mod['summary'],
+                    'project_type' => $type,
+                    'icon_url' => $mod['logo']['url'] ?? null,
+                    'author' => $mod['authors'][0]['name'] ?? null,
+                    'downloads' => $mod['downloadCount'],
+                    'likes' => $mod['thumbsUpCount'] ?? 0,
+                ];
+
+                if (in_array($type, ['mod', 'plugin'], true)) {
+                    $hit['loaders'] = array_values(array_intersect(
+                        array_map(fn ($c) => strtolower($c['name'] ?? ''), $mod['categories'] ?? []),
+                        $loaderTypes
+                    ));
+                } else {
+                    $indexes = $mod['latestFilesIndexes'] ?? [];
+                    $wanted = $params['version'] ?? null;
+                    $match = $wanted
+                        ? current(array_filter($indexes, fn ($i) => ($i['gameVersion'] ?? null) === $wanted))
+                        : ($indexes[0] ?? null);
+                    $hit['latest_version'] = $match['gameVersion'] ?? ($indexes[0]['gameVersion'] ?? null);
+                }
+
+                return $hit;
+            }, $data['data']);
+
+            // CurseForge has no per-project client/server-only field in its
+            // public API — no equivalent filter here (known gap, see ModrinthProvider).
+            return ['hits' => $hits, 'total_hits' => $data['pagination']['totalCount'] ?? count($hits)];
+        });
     }
 
     public function projectVersions(string $projectId, array $filters): array
@@ -85,34 +108,39 @@ class CurseForgeProvider implements LibraryProvider
             $query['gameVersion'] = $version;
         }
 
-        $response = $this->http->get("mods/{$projectId}/files", ['query' => $query]);
-        $data = json_decode($response->getBody()->getContents(), true);
-
         $loaders = array_filter(explode(',', $filters['loaders'] ?? ''));
 
-        $files = $data['data'];
-        if ($loaders) {
-            $files = array_values(array_filter($files, function ($file) use ($loaders) {
-                $fileLoaders = array_map('strtolower', $file['gameVersions'] ?? []);
+        return $this->cached(
+            "mclibrarymgr:curseforge:projectversions:{$projectId}:" . md5(json_encode($query) . json_encode($loaders)),
+            function () use ($projectId, $query, $loaders) {
+                $response = $this->http->get("mods/{$projectId}/files", ['query' => $query]);
+                $data = json_decode($response->getBody()->getContents(), true);
 
-                return array_intersect(array_map('strtolower', $loaders), $fileLoaders) !== [];
-            }));
-        }
+                $files = $data['data'];
+                if ($loaders) {
+                    $files = array_values(array_filter($files, function ($file) use ($loaders) {
+                        $fileLoaders = array_map('strtolower', $file['gameVersions'] ?? []);
 
-        return array_map(fn ($file) => [
-            'id' => (string) $file['id'],
-            'version_number' => $file['displayName'],
-            'game_versions' => $file['gameVersions'],
-            'loaders' => array_values(array_intersect(
-                $file['gameVersions'],
-                ['Forge', 'Fabric', 'NeoForge', 'Quilt', 'Paper', 'Spigot', 'Purpur', 'Bukkit', 'Folia', 'Velocity', 'Waterfall', 'BungeeCord']
-            )),
-            'files' => [[
-                'url' => $file['downloadUrl'],
-                'filename' => $file['fileName'],
-                'sha1' => $this->sha1FromHashes($file),
-            ]],
-        ], $files);
+                        return array_intersect(array_map('strtolower', $loaders), $fileLoaders) !== [];
+                    }));
+                }
+
+                return array_map(fn ($file) => [
+                    'id' => (string) $file['id'],
+                    'version_number' => $file['displayName'],
+                    'game_versions' => $file['gameVersions'],
+                    'loaders' => array_values(array_intersect(
+                        $file['gameVersions'],
+                        ['Forge', 'Fabric', 'NeoForge', 'Quilt', 'Paper', 'Spigot', 'Purpur', 'Bukkit', 'Folia', 'Velocity', 'Waterfall', 'BungeeCord']
+                    )),
+                    'files' => [[
+                        'url' => $file['downloadUrl'],
+                        'filename' => $file['fileName'],
+                        'sha1' => $this->sha1FromHashes($file),
+                    ]],
+                ], $files);
+            }
+        );
     }
 
     // CurseForge HashAlgo enum: 1 = Sha1, 2 = Md5.
@@ -158,44 +186,55 @@ class CurseForgeProvider implements LibraryProvider
 
         $fingerprintByKey = array_map(fn ($sha1) => (int) hexdec(substr($sha1, 0, 8)), $hashesByKey);
 
-        try {
-            $matches = json_decode($this->http->post('fingerprints/432', [
-                'json' => ['fingerprints' => array_values(array_unique($fingerprintByKey))],
-            ])->getBody()->getContents(), true)['data']['exactMatches'] ?? [];
+        $uniqueFingerprints = array_values(array_unique($fingerprintByKey));
+        sort($uniqueFingerprints);
+        $cacheKey = 'mclibrarymgr:curseforge:identify:' . md5(json_encode($uniqueFingerprints));
 
-            $modIdByFingerprint = [];
-            foreach ($matches as $match) {
-                $modIdByFingerprint[$match['file']['fileFingerprint']] = $match['id'];
-            }
+        $modByFingerprint = Cache::get($cacheKey);
+        if ($modByFingerprint === null) {
+            try {
+                $matches = json_decode($this->http->post('fingerprints/432', [
+                    'json' => ['fingerprints' => $uniqueFingerprints],
+                ])->getBody()->getContents(), true)['data']['exactMatches'] ?? [];
 
-            $modIds = array_values(array_unique($modIdByFingerprint));
-            if (!$modIds) {
+                $modIdByFingerprint = [];
+                foreach ($matches as $match) {
+                    $modIdByFingerprint[$match['file']['fileFingerprint']] = $match['id'];
+                }
+
+                $modIds = array_values(array_unique($modIdByFingerprint));
+                $modsById = $modIds ? array_column(
+                    json_decode($this->http->post('mods', [
+                        'json' => ['modIds' => $modIds],
+                    ])->getBody()->getContents(), true)['data'],
+                    null,
+                    'id'
+                ) : [];
+            } catch (\Exception $exception) {
+                // API hiccup — don't cache a failure, just report nothing found this request.
                 return $result;
             }
 
-            $modsById = array_column(
-                json_decode($this->http->post('mods', [
-                    'json' => ['modIds' => $modIds],
-                ])->getBody()->getContents(), true)['data'],
-                null,
-                'id'
-            );
-        } catch (\Exception $exception) {
-            return $result;
+            $modByFingerprint = [];
+            foreach ($uniqueFingerprints as $fingerprint) {
+                $mod = $modsById[$modIdByFingerprint[$fingerprint] ?? null] ?? null;
+                if ($mod) {
+                    $modByFingerprint[$fingerprint] = [
+                        'project_id' => (string) $mod['id'],
+                        'slug' => $mod['slug'],
+                        'title' => $mod['name'],
+                        'description' => $mod['summary'],
+                        'icon_url' => $mod['logo']['url'] ?? null,
+                        'downloads' => $mod['downloadCount'],
+                    ];
+                }
+            }
+
+            Cache::put($cacheKey, $modByFingerprint, self::CACHE_TTL);
         }
 
         foreach ($fingerprintByKey as $key => $fingerprint) {
-            $mod = $modsById[$modIdByFingerprint[$fingerprint] ?? null] ?? null;
-            if ($mod) {
-                $result[$key] = [
-                    'project_id' => (string) $mod['id'],
-                    'slug' => $mod['slug'],
-                    'title' => $mod['name'],
-                    'description' => $mod['summary'],
-                    'icon_url' => $mod['logo']['url'] ?? null,
-                    'downloads' => $mod['downloadCount'],
-                ];
-            }
+            $result[$key] = $modByFingerprint[$fingerprint] ?? null;
         }
 
         return $result;
@@ -221,44 +260,63 @@ class CurseForgeProvider implements LibraryProvider
             }
         }
 
-        $response = $this->http->get('mods/search', ['query' => $query]);
-        $data = json_decode($response->getBody()->getContents(), true);
+        return $this->cached('mclibrarymgr:curseforge:searchmodpacks:' . md5(json_encode($query)), function () use ($query) {
+            $response = $this->http->get('mods/search', ['query' => $query]);
+            $data = json_decode($response->getBody()->getContents(), true);
 
-        $hits = array_map(fn ($mod) => [
-            'project_id' => (string) $mod['id'],
-            'slug' => $mod['slug'],
-            'title' => $mod['name'],
-            'description' => $mod['summary'],
-            'project_type' => 'modpack',
-            'icon_url' => $mod['logo']['url'] ?? null,
-            'author' => $mod['authors'][0]['name'] ?? null,
-            'downloads' => $mod['downloadCount'],
-            'loaders' => array_values(array_intersect(
-                array_map(fn ($c) => strtolower($c['name'] ?? ''), $mod['categories'] ?? []),
-                array_keys(self::MOD_LOADER_TYPES)
-            )),
-        ], $data['data']);
+            $hits = array_map(fn ($mod) => [
+                'project_id' => (string) $mod['id'],
+                'slug' => $mod['slug'],
+                'title' => $mod['name'],
+                'description' => $mod['summary'],
+                'project_type' => 'modpack',
+                'icon_url' => $mod['logo']['url'] ?? null,
+                'author' => $mod['authors'][0]['name'] ?? null,
+                'downloads' => $mod['downloadCount'],
+                'likes' => $mod['thumbsUpCount'] ?? 0,
+                'loaders' => array_values(array_intersect(
+                    array_map(fn ($c) => strtolower($c['name'] ?? ''), $mod['categories'] ?? []),
+                    array_keys(self::MOD_LOADER_TYPES)
+                )),
+            ], $data['data']);
 
-        return ['hits' => $hits, 'total_hits' => $data['pagination']['totalCount'] ?? count($hits)];
+            return ['hits' => $hits, 'total_hits' => $data['pagination']['totalCount'] ?? count($hits)];
+        });
     }
 
     public function projectInfo(string $projectId): ?array
     {
-        return Cache::remember("mclibrarymgr:curseforge:projectinfo:{$projectId}", self::CACHE_TTL, function () use ($projectId) {
+        return $this->cached("mclibrarymgr:curseforge:projectinfo:{$projectId}", function () use ($projectId) {
             try {
                 $mod = json_decode(
                     $this->http->get("mods/{$projectId}")->getBody()->getContents(),
                     true
                 )['data'];
 
+                $loaderTypes = array_keys(self::MOD_LOADER_TYPES);
+                $categoryNames = array_map(fn ($c) => strtolower($c['name'] ?? ''), $mod['categories'] ?? []);
+                $projectType = array_search($mod['classId'] ?? null, self::CLASS_IDS, true) ?: 'modpack';
+
                 return [
                     'project_id' => (string) $mod['id'],
                     'slug' => $mod['slug'],
                     'title' => $mod['name'],
                     'description' => $mod['summary'],
-                    'project_type' => 'modpack',
+                    'project_type' => $projectType,
                     'icon_url' => $mod['logo']['url'] ?? null,
                     'downloads' => $mod['downloadCount'],
+                    'likes' => $mod['thumbsUpCount'] ?? 0,
+                    'categories' => array_values(array_diff($categoryNames, $loaderTypes)),
+                    'loaders' => array_values(array_intersect($categoryNames, $loaderTypes)),
+                    'game_versions' => array_slice(array_values(array_unique(array_column(
+                        $mod['latestFilesIndexes'] ?? [], 'gameVersion'
+                    ))), -10),
+                    // CurseForge's mod summary is short; fetching the full HTML
+                    // description needs a second `mods/{id}/description` call.
+                    // reuse the summary instead of the extra round trip
+                    'body' => $mod['summary'] ?? '',
+                    'updated' => $mod['dateModified'] ?? null,
+                    'published' => $mod['dateCreated'] ?? null,
                 ];
             } catch (\Exception $exception) {
                 return null;

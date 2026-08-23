@@ -194,6 +194,7 @@ class ModpackController extends Controller
             'name' => $request->input('name'),
             'version_number' => $request->input('version_number'),
             'paths' => $request->input('paths', []),
+            'installed_at' => now()->toIso8601String(),
         ]);
 
         return new JsonResponse(['message' => 'ok']);
