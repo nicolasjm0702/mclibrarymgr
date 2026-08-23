@@ -185,16 +185,31 @@ class CurseForgeProvider implements LibraryProvider
         }
 
         $fingerprintByKey = array_map(fn ($sha1) => (int) hexdec(substr($sha1, 0, 8)), $hashesByKey);
-
         $uniqueFingerprints = array_values(array_unique($fingerprintByKey));
-        sort($uniqueFingerprints);
-        $cacheKey = 'mclibrarymgr:curseforge:identify:' . md5(json_encode($uniqueFingerprints));
 
-        $modByFingerprint = Cache::get($cacheKey);
-        if ($modByFingerprint === null) {
+        // Cache per fingerprint, not per requested batch — so a later batch
+        // that reuses an already-resolved fingerprint only fetches new ones.
+        $cacheKeys = array_combine($uniqueFingerprints, array_map(
+            fn ($fingerprint) => "mclibrarymgr:curseforge:identify:{$fingerprint}",
+            $uniqueFingerprints
+        ));
+
+        $cached = Cache::many(array_values($cacheKeys));
+        $modByFingerprint = [];
+        $missingFingerprints = [];
+        foreach ($uniqueFingerprints as $fingerprint) {
+            $value = $cached[$cacheKeys[$fingerprint]] ?? null;
+            if ($value !== null) {
+                $modByFingerprint[$fingerprint] = $value === false ? null : $value;
+            } else {
+                $missingFingerprints[] = $fingerprint;
+            }
+        }
+
+        if ($missingFingerprints) {
             try {
                 $matches = json_decode($this->http->post('fingerprints/432', [
-                    'json' => ['fingerprints' => $uniqueFingerprints],
+                    'json' => ['fingerprints' => $missingFingerprints],
                 ])->getBody()->getContents(), true)['data']['exactMatches'] ?? [];
 
                 $modIdByFingerprint = [];
@@ -210,27 +225,29 @@ class CurseForgeProvider implements LibraryProvider
                     null,
                     'id'
                 ) : [];
-            } catch (\Exception $exception) {
-                // API hiccup — don't cache a failure, just report nothing found this request.
-                return $result;
-            }
 
-            $modByFingerprint = [];
-            foreach ($uniqueFingerprints as $fingerprint) {
-                $mod = $modsById[$modIdByFingerprint[$fingerprint] ?? null] ?? null;
-                if ($mod) {
-                    $modByFingerprint[$fingerprint] = [
+                $toCache = [];
+                foreach ($missingFingerprints as $fingerprint) {
+                    $mod = $modsById[$modIdByFingerprint[$fingerprint] ?? null] ?? null;
+                    // false = "looked up, no match" sentinel so it's still cached.
+                    $entry = $mod ? [
                         'project_id' => (string) $mod['id'],
                         'slug' => $mod['slug'],
                         'title' => $mod['name'],
                         'description' => $mod['summary'],
                         'icon_url' => $mod['logo']['url'] ?? null,
                         'downloads' => $mod['downloadCount'],
-                    ];
+                    ] : false;
+                    $modByFingerprint[$fingerprint] = $entry === false ? null : $entry;
+                    $toCache[$cacheKeys[$fingerprint]] = $entry;
+                }
+                Cache::putMany($toCache, self::CACHE_TTL);
+            } catch (\Exception $exception) {
+                // API hiccup — don't cache a failure, just report nothing found this request.
+                foreach ($missingFingerprints as $fingerprint) {
+                    $modByFingerprint[$fingerprint] = null;
                 }
             }
-
-            Cache::put($cacheKey, $modByFingerprint, self::CACHE_TTL);
         }
 
         foreach ($fingerprintByKey as $key => $fingerprint) {

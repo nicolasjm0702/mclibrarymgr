@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import Button from "@/components/elements/Button";
 import { TrashIcon } from "@heroicons/react/solid";
 import { Hit } from "./types";
@@ -15,6 +15,7 @@ interface ManageRowProps {
     updating?: boolean;
     uninstalling?: boolean;
     provider?: string;
+    onVisible?: () => void;
 }
 
 export default function ManageRow({
@@ -28,12 +29,29 @@ export default function ManageRow({
     updating,
     uninstalling,
     provider,
+    onVisible,
 }: ManageRowProps) {
     const title = hit?.title ?? filename;
     const description = hit === undefined ? "Looking up details…" : hit === null ? "Not found on this source." : undefined;
+    const rowRef = useRef<HTMLDivElement>(null);
+
+    // Only rows scrolled into view get identified — avoids identifying all
+    // installed files at once when a server has hundreds of mods.
+    useEffect(() => {
+        if (!onVisible || !rowRef.current) return;
+        const observer = new IntersectionObserver(([entry]) => {
+            if (entry.isIntersecting) {
+                onVisible();
+                observer.disconnect();
+            }
+        });
+        observer.observe(rowRef.current);
+        return () => observer.disconnect();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
 
     return (
-        <div className="flex items-center gap-3 p-3 rounded-lg bg-white/[0.04]">
+        <div ref={rowRef} className="flex items-center gap-3 p-3 rounded-lg bg-white/[0.04]">
             {hit?.icon_url ? (
                 <img src={hit.icon_url} alt={title} className="w-10 h-10 rounded-md flex-shrink-0" />
             ) : (

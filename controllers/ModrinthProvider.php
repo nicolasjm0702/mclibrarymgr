@@ -49,13 +49,6 @@ class ModrinthProvider implements LibraryProvider
             $response = $this->http->get('search', ['query' => $query]);
             $data = json_decode($response->getBody()->getContents(), true);
 
-            if (($params['type'] ?? 'mod') === 'mod') {
-                $data['hits'] = array_values(array_filter(
-                    $data['hits'] ?? [],
-                    fn ($hit) => ($hit['server_side'] ?? 'required') !== 'unsupported'
-                ));
-            }
-
             $loaderList = ['fabric', 'forge', 'neoforge', 'quilt', 'paper', 'spigot', 'purpur', 'bukkit', 'folia', 'velocity', 'waterfall', 'bungeecord'];
             $type = $params['type'] ?? 'mod';
 
@@ -64,6 +57,7 @@ class ModrinthProvider implements LibraryProvider
 
                 if (in_array($type, ['mod', 'plugin'], true)) {
                     $hit['loaders'] = array_values(array_intersect($hit['categories'] ?? [], $loaderList));
+                    $hit['client_only'] = ($hit['server_side'] ?? 'required') === 'unsupported';
                 } else {
                     $versions = $hit['versions'] ?? [];
                     $matching = $params['version'] ?? null
@@ -132,15 +126,30 @@ class ModrinthProvider implements LibraryProvider
             return $result;
         }
 
+        // Cache per hash, not per requested batch — so a later batch that
+        // reuses an already-resolved hash only fetches the new ones.
         $uniqueHashes = array_values(array_unique($hashesByKey));
-        sort($uniqueHashes);
-        $cacheKey = 'mclibrarymgr:modrinth:identify:' . md5(json_encode($uniqueHashes));
+        $cacheKeys = array_combine($uniqueHashes, array_map(
+            fn ($hash) => "mclibrarymgr:modrinth:identify:{$hash}",
+            $uniqueHashes
+        ));
 
-        $byHash = Cache::get($cacheKey);
-        if ($byHash === null) {
+        $cached = Cache::many(array_values($cacheKeys));
+        $byHash = [];
+        $missingHashes = [];
+        foreach ($uniqueHashes as $hash) {
+            $value = $cached[$cacheKeys[$hash]] ?? null;
+            if ($value !== null) {
+                $byHash[$hash] = $value === false ? null : $value;
+            } else {
+                $missingHashes[] = $hash;
+            }
+        }
+
+        if ($missingHashes) {
             try {
                 $versionsByHash = json_decode($this->http->post('version_files', [
-                    'json' => ['hashes' => $uniqueHashes, 'algorithm' => 'sha1'],
+                    'json' => ['hashes' => $missingHashes, 'algorithm' => 'sha1'],
                 ])->getBody()->getContents(), true);
 
                 $projectIds = array_values(array_unique(array_column($versionsByHash, 'project_id')));
@@ -151,16 +160,12 @@ class ModrinthProvider implements LibraryProvider
                     null,
                     'id'
                 ) : [];
-            } catch (\Exception $exception) {
-                // API hiccup — don't cache a failure, just report nothing found this request.
-                return $result;
-            }
 
-            $byHash = [];
-            foreach ($uniqueHashes as $hash) {
-                $project = $projectsById[$versionsByHash[$hash]['project_id'] ?? null] ?? null;
-                if ($project) {
-                    $byHash[$hash] = [
+                $toCache = [];
+                foreach ($missingHashes as $hash) {
+                    $project = $projectsById[$versionsByHash[$hash]['project_id'] ?? null] ?? null;
+                    // false = "looked up, no match" sentinel so it's still cached.
+                    $entry = $project ? [
                         'project_id' => $project['id'],
                         'slug' => $project['slug'],
                         'title' => $project['title'],
@@ -168,11 +173,17 @@ class ModrinthProvider implements LibraryProvider
                         'icon_url' => $project['icon_url'],
                         'downloads' => $project['downloads'],
                         'likes' => $project['followers'] ?? 0,
-                    ];
+                    ] : false;
+                    $byHash[$hash] = $entry === false ? null : $entry;
+                    $toCache[$cacheKeys[$hash]] = $entry;
+                }
+                Cache::putMany($toCache, self::CACHE_TTL);
+            } catch (\Exception $exception) {
+                // API hiccup — don't cache a failure, just report nothing found this request.
+                foreach ($missingHashes as $hash) {
+                    $byHash[$hash] = null;
                 }
             }
-
-            Cache::put($cacheKey, $byHash, self::CACHE_TTL);
         }
 
         foreach ($hashesByKey as $key => $hash) {

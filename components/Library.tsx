@@ -278,7 +278,6 @@ export default () => {
             .then(({ data }) => {
                 const files: InstalledEntry[] = data.files ?? [];
                 setInstalledFiles(files);
-                identifyInstalledFiles(forType, files);
             })
             .catch((error) =>
                 addFlash({
@@ -407,17 +406,25 @@ export default () => {
             .catch(() => setIdentified((prev) => ({ ...prev, [file.name]: null })));
     }, [type, uuid, installedFiles]);
 
-    const identifyInstalledFiles = (forType: string, files: InstalledEntry[]) => {
-        if (forType === "resourcepack") return;
+    const typeRef = useRef(type);
+    useEffect(() => {
+        typeRef.current = type;
+    }, [type]);
 
+    // Only mods scrolled into view (see ManageRow's onVisible) get queued here —
+    // with 300+ installed mods we don't want to identify all of them up front.
+    const pendingIdentifyRef = useRef<Set<string>>(new Set());
+    const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+    const flushIdentifyQueue = () => {
+        const names = Array.from(pendingIdentifyRef.current);
+        pendingIdentifyRef.current.clear();
+        if (!names.length) return;
+
+        const forType = typeRef.current;
         const CHUNK_SIZE = 15;
-        const pendingNames = files
-            .map((f) => f.name)
-            .filter((name) => !(name in identifiedRef.current));
-
-        const runChunk = (start: number) => {
-            if (start >= pendingNames.length) return;
-            const chunk = pendingNames.slice(start, start + CHUNK_SIZE);
+        for (let start = 0; start < names.length; start += CHUNK_SIZE) {
+            const chunk = names.slice(start, start + CHUNK_SIZE);
 
             http.post(
                 `/api/client/extensions/mclibrarymgr/servers/${uuid}/identify-batch`,
@@ -455,11 +462,29 @@ export default () => {
                         ...prev,
                         ...Object.fromEntries(chunk.map((name) => [name, null])),
                     }));
-                })
-                .finally(() => runChunk(start + CHUNK_SIZE));
-        };
+                });
+        }
+    };
 
-        runChunk(0);
+    const IDENTIFY_BATCH_SIZE = 15;
+    const queueIdentify = (name: string) => {
+        if (name in identifiedRef.current || pendingIdentifyRef.current.has(name)) return;
+        pendingIdentifyRef.current.add(name);
+
+        // Flush as soon as a full batch of 15 is queued; otherwise wait for
+        // scrolling to pause before sending a smaller, final batch.
+        if (pendingIdentifyRef.current.size >= IDENTIFY_BATCH_SIZE) {
+            if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
+            flushTimerRef.current = null;
+            flushIdentifyQueue();
+            return;
+        }
+
+        if (flushTimerRef.current) clearTimeout(flushTimerRef.current);
+        flushTimerRef.current = setTimeout(() => {
+            flushTimerRef.current = null;
+            flushIdentifyQueue();
+        }, 400);
     };
 
     const doInstall = (hit: Hit, params: Record<string, string>) => {
@@ -923,6 +948,11 @@ export default () => {
                                         uninstalling={uninstalling[f.name]}
                                         onUpdate={() => openUpdateDialog(f, hit)}
                                         onUninstall={() => setConfirmUninstall(f)}
+                                        onVisible={
+                                            hit === undefined
+                                                ? () => queueIdentify(f.name)
+                                                : undefined
+                                        }
                                     />
                                 </div>
                             );

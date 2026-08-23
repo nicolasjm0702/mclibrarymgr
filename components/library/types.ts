@@ -10,6 +10,7 @@ export interface Hit {
     likes: number;
     loaders?: string[];
     latest_version?: string | null;
+    client_only?: boolean;
 }
 
 export interface Version {
