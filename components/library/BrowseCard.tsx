@@ -1,5 +1,5 @@
 import React from "react";
-import { DownloadIcon, HeartIcon, UserIcon, InformationCircleIcon, DesktopComputerIcon } from "@heroicons/react/solid";
+import { DownloadIcon, HeartIcon, UserIcon, InformationCircleIcon, DesktopComputerIcon, BanIcon } from "@heroicons/react/solid";
 import Button from "@/components/elements/Button";
 import { Hit } from "./types";
 import { formatDownloads } from "./format";
@@ -27,12 +27,24 @@ export default function BrowseCard({
 }: BrowseCardProps) {
     return (
         <div className="relative flex flex-col gap-2 p-3 rounded-lg bg-white/[0.04] h-full">
-            {hit.client_only && (
-                <div
-                    className="absolute top-2 right-2 w-6 h-6 flex items-center justify-center rounded-full bg-neutral-900/80"
-                    title="Client-side mod — may not affect the server"
-                >
-                    <DesktopComputerIcon className="w-3.5 h-3.5 text-yellow-400" />
+            {(hit.client_only || hit.no_direct_download) && (
+                <div className="absolute top-2 right-2 flex items-center gap-1">
+                    {hit.client_only && (
+                        <div
+                            className="w-6 h-6 flex items-center justify-center rounded-full bg-neutral-900/80"
+                            title="Client-side mod — may not affect the server"
+                        >
+                            <DesktopComputerIcon className="w-3.5 h-3.5 text-yellow-400" />
+                        </div>
+                    )}
+                    {hit.no_direct_download && (
+                        <div
+                            className="w-6 h-6 flex items-center justify-center rounded-full bg-neutral-900/80"
+                            title="Author disabled third-party downloads — cannot be installed directly"
+                        >
+                            <BanIcon className="w-3.5 h-3.5 text-red-400" />
+                        </div>
+                    )}
                 </div>
             )}
             <div className="flex items-center gap-3">
@@ -68,6 +80,7 @@ export default function BrowseCard({
 
             <p
                 className="text-xs opacity-70 flex-1"
+                title={hit.description}
                 css={{
                     overflow: "hidden",
                     textOverflow: "ellipsis",
