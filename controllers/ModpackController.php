@@ -116,6 +116,7 @@ class ModpackController extends Controller
                 fn ($entry) => array_diff_key($entry, ['zip_name' => true]),
                 $manifest['entries']
             ),
+            'skipped' => $manifest['skipped'] ?? [],
         ]);
     }
 

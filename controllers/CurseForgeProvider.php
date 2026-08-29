@@ -76,6 +76,7 @@ class CurseForgeProvider implements LibraryProvider
                     'author' => $mod['authors'][0]['name'] ?? null,
                     'downloads' => $mod['downloadCount'],
                     'likes' => $mod['thumbsUpCount'] ?? 0,
+                    'no_direct_download' => ($mod['allowModDistribution'] ?? true) === false,
                 ];
 
                 if (in_array($type, ['mod', 'plugin'], true)) {
@@ -161,8 +162,12 @@ class CurseForgeProvider implements LibraryProvider
             $response = $this->http->get("mods/{$installParams['project_id']}/files/{$fileId}");
             $file = json_decode($response->getBody()->getContents(), true)['data'];
 
+            if (empty($file['downloadUrl'])) {
+                throw new \RuntimeException('This file\'s author has disabled third-party downloads on CurseForge.');
+            }
+
             return [
-                'url' => $file['downloadUrl'],
+                'url' => $this->resolveDirectUrl($file['downloadUrl']),
                 'filename' => $file['fileName'],
                 'sha1' => $this->sha1FromHashes($file),
             ];
@@ -174,7 +179,97 @@ class CurseForgeProvider implements LibraryProvider
             throw new \RuntimeException('No version matches the selected game version and loader.');
         }
 
-        return $versions[0]['files'][0];
+        $file = $versions[0]['files'][0];
+        if (empty($file['url'])) {
+            throw new \RuntimeException('This file\'s author has disabled third-party downloads on CurseForge.');
+        }
+
+        return [
+            'url' => $this->resolveDirectUrl($file['url']),
+            'filename' => $file['filename'],
+            'sha1' => $file['sha1'],
+        ];
+    }
+
+    // CurseForge's CDN (edge.forgecdn.net) 302-redirects to the actual file
+    // host; Wings' own downloader rejects non-2xx responses, so we must
+    // follow that single hop ourselves before handing the URL off to it.
+    private function resolveDirectUrl(string $url): string
+    {
+        $response = $this->http->get($url, ['allow_redirects' => false, 'stream' => true]);
+        $response->getBody()->close();
+
+        if ($response->getStatusCode() >= 300 && $response->getStatusCode() < 400) {
+            return $response->getHeaderLine('Location') ?: $url;
+        }
+
+        return $url;
+    }
+
+    // CurseForge identifies files by its own fingerprint, not sha1: murmur2
+    // (seed 1) over the file bytes with whitespace bytes (tab/LF/CR/space)
+    // stripped first. https://docs.curseforge.com/rest-api/#fingerprint-match
+    private function fingerprint(string $content): int
+    {
+        $filtered = str_replace(["\x09", "\x0a", "\x0d", "\x20"], '', $content);
+
+        return $this->murmur2($filtered, 1);
+    }
+
+    private function murmur32Mul(int $a, int $b): int
+    {
+        $aLow = $a & 0xFFFF;
+        $aHigh = ($a >> 16) & 0xFFFF;
+        $bLow = $b & 0xFFFF;
+        $bHigh = ($b >> 16) & 0xFFFF;
+
+        $low = $aLow * $bLow;
+        $mid = ($aHigh * $bLow + $aLow * $bHigh) & 0xFFFFFFFF;
+
+        return ($low + (($mid & 0xFFFF) << 16)) & 0xFFFFFFFF;
+    }
+
+    private function murmur2(string $data, int $seed): int
+    {
+        $m = 0x5bd1e995;
+        $len = strlen($data);
+        $h = ($seed ^ $len) & 0xFFFFFFFF;
+
+        $i = 0;
+        while ($len - $i >= 4) {
+            $k = unpack('V', substr($data, $i, 4))[1];
+            $k = $this->murmur32Mul($k, $m);
+            $k ^= $k >> 24;
+            $k = $this->murmur32Mul($k, $m);
+
+            $h = $this->murmur32Mul($h, $m);
+            $h ^= $k;
+
+            $i += 4;
+        }
+
+        $remaining = $len - $i;
+        if ($remaining === 3) {
+            $h ^= ord($data[$i + 2]) << 16;
+        }
+        if ($remaining >= 2) {
+            $h ^= ord($data[$i + 1]) << 8;
+        }
+        if ($remaining >= 1) {
+            $h ^= ord($data[$i]);
+            $h = $this->murmur32Mul($h, $m);
+        }
+
+        $h ^= $h >> 13;
+        $h = $this->murmur32Mul($h, $m);
+        $h ^= $h >> 15;
+
+        return $h & 0xFFFFFFFF;
+    }
+
+    public function hashContent(string $content): string
+    {
+        return (string) $this->fingerprint($content);
     }
 
     public function identifyByHashes(array $hashesByKey): array
@@ -184,7 +279,7 @@ class CurseForgeProvider implements LibraryProvider
             return $result;
         }
 
-        $fingerprintByKey = array_map(fn ($sha1) => (int) hexdec(substr($sha1, 0, 8)), $hashesByKey);
+        $fingerprintByKey = array_map('intval', $hashesByKey);
         $uniqueFingerprints = array_values(array_unique($fingerprintByKey));
 
         // Cache per fingerprint, not per requested batch — so a later batch
@@ -351,6 +446,10 @@ class CurseForgeProvider implements LibraryProvider
             true
         )['data'];
 
+        if (empty($file['downloadUrl'])) {
+            throw new \RuntimeException('This modpack\'s author has disabled third-party downloads on CurseForge.');
+        }
+
         $archivePath = tempnam(sys_get_temp_dir(), 'mclibrarymgr_');
         $this->http->get($file['downloadUrl'], ['sink' => $archivePath]);
 
@@ -365,6 +464,7 @@ class CurseForgeProvider implements LibraryProvider
         ));
 
         $entries = [];
+        $skipped = [];
         if ($modRefs) {
             $response = $this->http->post('mods/files', [
                 'json' => ['fileIds' => array_map(fn ($ref) => $ref['fileID'], $modRefs)],
@@ -372,10 +472,16 @@ class CurseForgeProvider implements LibraryProvider
             $files = json_decode($response->getBody()->getContents(), true)['data'];
 
             foreach ($files as $modFile) {
+                if (empty($modFile['downloadUrl'])) {
+                    // Author disabled third-party distribution on CurseForge; no URL to pull from.
+                    $skipped[] = $modFile['fileName'];
+                    continue;
+                }
+
                 $entries[] = [
                     'path' => 'mods/' . $modFile['fileName'],
                     'kind' => 'download',
-                    'url' => $modFile['downloadUrl'],
+                    'url' => $this->resolveDirectUrl($modFile['downloadUrl']),
                 ];
             }
         }
@@ -407,6 +513,7 @@ class CurseForgeProvider implements LibraryProvider
             'version_number' => $manifest['version'] ?? $file['displayName'],
             'archive_path' => $archivePath,
             'entries' => $entries,
+            'skipped' => $skipped,
         ];
     }
 }

@@ -11,6 +11,7 @@ export interface Hit {
     loaders?: string[];
     latest_version?: string | null;
     client_only?: boolean;
+    no_direct_download?: boolean;
 }
 
 export interface Version {

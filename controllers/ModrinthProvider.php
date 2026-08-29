@@ -119,6 +119,11 @@ class ModrinthProvider implements LibraryProvider
         return $file;
     }
 
+    public function hashContent(string $content): string
+    {
+        return sha1($content);
+    }
+
     public function identifyByHashes(array $hashesByKey): array
     {
         $result = array_fill_keys(array_keys($hashesByKey), null);

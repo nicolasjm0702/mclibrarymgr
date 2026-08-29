@@ -188,13 +188,18 @@ class LibraryController extends Controller
             return new JsonResponse(['message' => 'Resource packs are identified directly, not by hash.'], 422);
         }
 
+        // Individual mod jars regularly run 30-100MB; hashing one fully in
+        // memory can exceed PHP's default 128M limit on its own.
+        // ponytail: bumped per-request, raise further (or stream-hash) if this stops being enough.
+        ini_set('memory_limit', '512M');
+
         $repository = $this->fileRepository->setServer($server);
 
         $hashesByFilename = [];
         foreach ($request->input('filenames', []) as $filename) {
             try {
                 $content = $repository->getContent(self::FOLDERS[$type] . '/' . $filename, 200 * 1024 * 1024);
-                $hashesByFilename[$filename] = sha1($content);
+                $hashesByFilename[$filename] = $this->provider->hashContent($content);
             } catch (\Exception $exception) {
                 // Unreadable — left out of the batch, frontend treats a
                 // missing key the same as "not identified".
